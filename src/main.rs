@@ -1,3 +1,7 @@
+// Release: GUI subsystem so launching from Explorer/Shell shows no console
+// window — the app is tray-only. Debug keeps the console for e2e stderr.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod capture;
 mod config;
