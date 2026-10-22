@@ -91,3 +91,11 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
    clock onto the file timeline. This avoids the per-segment cold start that previously caused a ~1 s
    frozen frame + audio dropout at every resume. ffmpeg children are assigned to a Win32 job object so
    they can never outlive the app.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Note: `ffmpeg.exe` is a separate program with its own license (the bundled BtbN `win64-gpl` build
+is GPL). Snapper invokes it as an external child process and does not link against it; comply with
+ffmpeg's license when redistributing the bundle.
