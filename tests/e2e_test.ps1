@@ -33,7 +33,7 @@ public class W {
 }
 "@
 
-$outDir = Join-Path $env:USERPROFILE "Videos\Snapper"
+$outDir = Join-Path $PSScriptRoot "..\target\debug\output"
 $before = @(Get-ChildItem $outDir -Filter *.mp4 -ErrorAction SilentlyContinue)
 
 $err = Join-Path $env:TEMP "snapper_err.txt"

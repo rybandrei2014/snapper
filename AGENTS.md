@@ -62,7 +62,8 @@ Notes:
 - The button bars are driven via the `WM_SNAP_CLICK` (`0x8010`) hook sent to the
   `SnapperAction` / `SnapperCtl` windows (wParam = button id), not by clicking pixels.
   Action bar ids: 1=Record, 2=Screenshot, 3=Cancel. Ctl bar ids: 1=Pause/Resume toggle, 2=Stop.
-- Output MP4/PNG land in `%USERPROFILE%\Videos\Snapper`; screenshots land in `%TEMP%`.
+- Output MP4/PNG land in `target\debug\output` (next to the debug exe the scripts launch);
+  bar screenshots land in `%TEMP%`.
 - Pass criteria: e2e produces a new MP4 (~7 s for the scripted run); `test_sync.ps1` shows the
   audio tone and video flash within ~50 ms; `test_sync2.ps1` shows the two event onsets separated
   by (clip gap − paused seconds) — i.e. the pause trim is correct.
@@ -84,7 +85,8 @@ Notes:
   re-encode trim of paused spans).
 - `audio.rs` — WASAPI loopback (system audio) + optional mic, streamed as raw PCM over a named pipe
   into the same ffmpeg process so A/V share one clock.
-- `config.rs` — load/save `%APPDATA%\Snapper\config.json` (see README table).
+- `config.rs` — load/save `config.json` next to the exe (portable; `%APPDATA%\Snapper` fallback
+  when the exe folder isn't writable, legacy `%APPDATA%` config auto-migrates). See README table.
 - `util.rs` — small helpers (e.g. `wide`/`u16s` wide-string conversion, error helpers).
 
 ## Key constants & conventions
@@ -97,7 +99,8 @@ Notes:
 - Hotkeys: record = `Win+Shift+R` (id `HOTKEY_REC=1`); pause = `Win+Alt+P` (id `HOTKEY_PAUSE=2`),
   falls back to `Ctrl+Alt+P`. Never use `Win+Shift+P` (Windows display-switch hotkey).
 - Single instance: named mutex `Snapper.SingleInstance`.
-- Output: `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4`/`.png` (config-overridable).
+- Output: `<exe dir>\output\<yyyy-MM-dd_HH-mm-ss>.mp4`/`.png` — a portable work folder next to
+  `snapper.exe` (config-overridable). `capture.rs` does `create_dir_all` on demand.
 
 ## windows-rs 0.58 gotchas (cost hours — do not rediscover)
 

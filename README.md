@@ -25,11 +25,13 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
    `Win+Shift+R` again (or the bar / tray → Stop) finishes.
 5. **Screenshot**: writes a single PNG of the region.
 6. `Esc` / right-click cancels selection; `Esc` (or `Win+Shift+R`) dismisses the chooser.
-7. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4` / `.png`.
+7. Files land in an `output` folder **next to `snapper.exe`** (`<exe dir>\output\<yyyy-MM-dd_HH-mm-ss>.mp4` / `.png`).
 
 ## Configuration
 
-`%APPDATA%\Snapper\config.json` (created on first run):
+`config.json` **next to `snapper.exe`** (created on first run; falls back to
+`%APPDATA%\Snapper\config.json` if the exe folder isn't writable, and a legacy `%APPDATA%`
+config is migrated to the exe folder automatically):
 
 | key | default | meaning |
 |---|---|---|
@@ -39,7 +41,7 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
 | `audio` | true | capture system audio (WASAPI loopback of default render device) |
 | `mic` | false | also capture the default microphone and mix it with system audio |
 | `audio_bitrate_kbps` | 192 | AAC bitrate |
-| `output_dir` | `%USERPROFILE%\Videos\Snapper` | output folder |
+| `output_dir` | `<exe dir>\output` | output folder (portable: next to `snapper.exe`) |
 | `screenshot_dir` | null | PNG folder (defaults to `output_dir`) |
 | `ffmpeg_path` | null | explicit ffmpeg.exe path |
 | `output_idx_override` | null | force DXGI output index (monitor) |

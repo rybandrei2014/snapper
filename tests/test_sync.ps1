@@ -37,7 +37,7 @@ $clip = Join-Path $env:TEMP "syncclip.mp4"
 ffmpeg -v error -y -f lavfi -i 'color=c=black:s=1280x720:r=30:d=6,geq=lum=255*between(T\,3\,3.12):cb=128:cr=128' -f lavfi -i 'sine=frequency=1000:duration=0.12' -filter_complex '[1:a]adelay=3000|3000[a]' -map 0:v -map '[a]' -c:v libx264 -pix_fmt yuv420p -c:a aac $clip
 if (-not (Test-Path $clip)) { "clip gen failed"; exit 1 }
 
-$outDir = Join-Path $env:USERPROFILE "Videos\Snapper"
+$outDir = Join-Path $PSScriptRoot "..\target\debug\output"
 $before = @(Get-ChildItem $outDir -Filter *.mp4 -ErrorAction SilentlyContinue)
 $err = Join-Path $env:TEMP "snapper_err.txt"
 $o = Join-Path $env:TEMP "snapper_out.txt"
