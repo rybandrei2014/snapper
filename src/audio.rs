@@ -138,8 +138,7 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
         CoTaskMemFree(Some(wf as *const c_void));
         let capture: IAudioCaptureClient = client.GetService()?;
 
-        // Block until ffmpeg opens the pipe (its startup), so audio sample 0
-        // lines up with the moment ffmpeg starts its clock.
+        // Block until ffmpeg opens the pipe (its startup).
         match ConnectNamedPipe(pipe, None) {
             Ok(()) => {}
             Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => {}

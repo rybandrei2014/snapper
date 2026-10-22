@@ -76,8 +76,9 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   selection overlay and the click-through recording border; a topmost floating control bar
   (Pause/Resume · Stop) anchored just outside the region; `tray-icon` for the tray;
   `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
-- **Stop / pause:** `q` is written to ffmpeg's stdin, producing a clean, valid MP4; completion is
-  detected by polling the child process from the message loop. Pause simply ends the current
-  segment; resume starts a new one; on stop, segments are joined with the `concat` demuxer
-  (`-c copy`) — each segment is already muxed (video+audio), so the join is instant. ffmpeg children
-  are assigned to a Win32 job object so they can never outlive the app.
+- **Stop / pause:** one ffmpeg process records the whole session; it is never restarted. Pause/resume
+   just mark wall-clock spans; on stop, `q` closes ffmpeg cleanly and `finalize` cuts the paused spans
+   out of the continuous file with an exact re-encode trim (`trim`/`atrim`+`concat`), mapping the wall
+   clock onto the file timeline. This avoids the per-segment cold start that previously caused a ~1 s
+   frozen frame + audio dropout at every resume. ffmpeg children are assigned to a Win32 job object so
+   they can never outlive the app.

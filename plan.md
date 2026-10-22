@@ -137,13 +137,18 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - [x] Mic input mixed with loopback (second WASAPI capture → second pipe → `amix` inside ffmpeg;
       `mic: true` switch; degrades gracefully when no mic present) ✅ amix graph verified; real-mic
       path untested (dev machine has no capture device)
-- [x] **A/V sync fix:** audio now shares ffmpeg's clock (was: separate raw-file capture started
-      ~1.2 s after video → sound led picture by ~1.2 s). `test_sync.ps1` measures flash-vs-tone
-      offset in a recording: now ~50–150 ms (was ~1200 ms); residual is near the perceptual
-      threshold and partly the test player's own output latency.
-- [x] Pause/resume with segment concat: `Win+Alt+P` (fallback `Ctrl+Alt+P`; `Win+Shift+P` is the
-      Windows display-switch hotkey — do not use), tray Pause/Resume/Stop with enable states ✅
-      verified: 3 s + pause 2 s + 1.5 s → single 4.5 s MP4 with audio, twice in a row
+- [x] **A/V sync fix:** audio shares ffmpeg's clock (was: separate raw-file capture started ~1.2 s
+      after video → sound led picture). Audio threads open their pipe and stream as ffmpeg opens it.
+      No `-shortest`, no first-frame gate (both truncated/skewed recordings on static screens).
+      Residual is a ~0.4 s constant audio-init lag (WASAPI starts slightly after the first video
+      frame); near perceptual threshold, smaller on an active screen.
+- [x] Pause/resume = **single continuous recording + trim** (rewritten 2026-10-22): ffmpeg is never
+      restarted. Pause/resume mark wall-clock spans; at stop, `finalize` maps them onto the file
+      timeline (calibrating startup latency via ffprobe duration) and cuts them out with an exact
+      re-encode trim (`trim`/`atrim`+`concat`). Removes the per-segment cold start that caused the
+      ~1 s "stuck first frame" + audio dropout at every resume. `Win+Alt+P` (fallback `Ctrl+Alt+P`;
+      `Win+Shift+P` is the Windows display-switch hotkey — do not use), tray + control-bar buttons ✅
+      verified: 3 s + pause 2 s + 3 s → single ~6.9 s MP4, no gaps across the cut (`e2e_test.ps1`)
 - [x] Region screenshot (Snipping-Tool style): same drag-select, then a Record/Screenshot chooser;
       screenshot = `ddagrab -frames:v 1` → PNG in `screenshot_dir` (defaults to `output_dir`) ✅
       verified: 801×501 region → 801×501 PNG (`test_shot.ps1`)

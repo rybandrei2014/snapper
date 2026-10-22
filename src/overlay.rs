@@ -51,7 +51,6 @@ struct OverlayState {
 
 struct BorderState {
     hwnd: HWND,
-    bits: *mut u32,
     dib: HBITMAP,
     dc: HDC,
 }
@@ -383,7 +382,7 @@ pub fn show_border(rect: RECT) {
         }
         present(hwnd, dc, x, y, w, h);
 
-        *BORDER.lock().unwrap() = Some(BorderState { hwnd, bits, dib, dc });
+        *BORDER.lock().unwrap() = Some(BorderState { hwnd, dib, dc });
     }
 }
 

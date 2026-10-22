@@ -4,7 +4,7 @@ use crate::util;
 use anyhow::{anyhow, Result};
 use std::io::Write;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -44,9 +44,16 @@ pub struct Segment {
     stdin: Option<ChildStdin>,
     audio_stops: Vec<Arc<AtomicBool>>,
     audio_pipes: Vec<isize>,
+    start: std::time::Instant,
 }
 
 impl Segment {
+    /// Seconds of wall-clock since this capture started. Pause/resume points
+    /// are marked on this clock and mapped onto the file timeline at finalize.
+    pub fn elapsed(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
     /// Ask ffmpeg to finish this segment cleanly (writes moov atom).
     pub fn stop_signal(&mut self) {
         if let Some(mut s) = self.stdin.take() {
@@ -89,12 +96,6 @@ pub struct SegParams {
     pub w: i32,
     pub h: i32,
     pub output_idx: i32,
-}
-
-/// One recorded segment: a single muxed (video+audio) mp4.
-#[derive(Clone)]
-pub struct SegEntry {
-    pub video: PathBuf,
 }
 
 struct Variant {
@@ -224,7 +225,7 @@ pub fn start_segment(
     p: SegParams,
     seg_path: &Path,
     encoder_override: Option<&str>,
-) -> Result<(Segment, SegEntry)> {
+) -> Result<Segment> {
     let ffmpeg = util::find_ffmpeg(cfg)?;
     if let Some(dir) = seg_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -303,6 +304,16 @@ pub fn start_segment(
                 continue;
             }
 
+            // start audio threads now so WASAPI init overlaps ffmpeg startup;
+            // each blocks in ConnectNamedPipe until ffmpeg opens its input,
+            // then streams PCM in real time (single clock with video).
+            let mut audio_stops = Vec::new();
+            for (si, (src, _)) in audio_specs.iter().enumerate() {
+                let flag = Arc::new(AtomicBool::new(false));
+                audio::start(*src, pipe_handles[si], flag.clone());
+                audio_stops.push(flag);
+            }
+
             let args = build_args(variant, encoder, &audio_specs, &pipe_names, seg_path, cfg);
             let log_path = seg_path.with_extension(format!("v{vi}.{encoder}.log"));
             let log_file = std::fs::File::create(&log_path).ok();
@@ -350,22 +361,14 @@ pub fn start_segment(
                 }
             }
 
-            // start audio capture threads; each blocks in ConnectNamedPipe
-            // until ffmpeg opens that input, then streams in real time.
-            let mut audio_stops = Vec::new();
-            for (si, (src, _)) in audio_specs.iter().enumerate() {
-                let flag = Arc::new(AtomicBool::new(false));
-                audio::start(*src, pipe_handles[si], flag.clone());
-                audio_stops.push(flag);
-            }
-
-            // health window: bad variants (bad options, filter format errors)
-            // exit within ~1s. Do NOT gate on file size: static screens encode
-            // to near-zero bitrate and flush the mp4 only much later.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+            // short health window: bad variants (bad options, filter format
+            // errors) exit within ~100 ms. Keep it short so Resume feels
+            // instant and the UI thread isn't blocked; a later crash is caught
+            // by poll_segment, which retries with libx264.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
             let mut alive = true;
             while std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 if let Some(st) = child.try_wait()? {
                     alive = false;
                     last_err = format!("ffmpeg {encoder} exited: {:?}", st.code());
@@ -394,17 +397,13 @@ pub fn start_segment(
     let (child, stdin, audio_stops, audio_pipes) =
         started.ok_or_else(|| anyhow!("no working capture: {last_err}"))?;
 
-    Ok((
-        Segment {
-            child,
-            stdin: Some(stdin),
-            audio_stops,
-            audio_pipes,
-        },
-        SegEntry {
-            video: seg_path.to_path_buf(),
-        },
-    ))
+    Ok(Segment {
+        child,
+        stdin: Some(stdin),
+        audio_stops,
+        audio_pipes,
+        start: std::time::Instant::now(),
+    })
 }
 
 /// Grab a single still frame of the region to a PNG (Snipping-Tool style).
@@ -448,65 +447,158 @@ pub fn grab_frame(cfg: &Config, p: SegParams, out: &Path) -> Result<()> {
     Err(anyhow!("no working frame grab: {last_err}"))
 }
 
-/// Join finished (already muxed) segments into the final file.
-pub fn finalize(cfg: &Config, base: &Path, segments: &[SegEntry]) -> Result<()> {
-    let good: Vec<&SegEntry> = segments
+/// Produce the final file from one continuous recording by cutting out the
+/// paused spans. `paused_wall` are (start,end) seconds on the wall-clock since
+/// capture started; `total_wall` is the wall-clock elapsed at stop. The wall
+/// clock is mapped onto the file timeline by calibrating the startup latency.
+pub fn finalize(
+    cfg: &Config,
+    base: &Path,
+    raw: &Path,
+    paused_wall: &[(f64, f64)],
+    total_wall: f64,
+) -> Result<()> {
+    if std::fs::metadata(raw).map(|m| m.len() <= 1024).unwrap_or(true) {
+        cleanup(raw);
+        return Err(anyhow!("no valid recording"));
+    }
+
+    if paused_wall.is_empty() {
+        std::fs::rename(raw, base)?;
+        return Ok(());
+    }
+
+    let total_out = ffprobe_duration(cfg, raw)?;
+    // ffmpeg's first frame lags spawn by a constant `init`; map wall → output.
+    let init = (total_wall - total_out).max(0.0);
+    let spans: Vec<(f64, f64)> = paused_wall
         .iter()
-        .filter(|s| std::fs::metadata(&s.video).map(|m| m.len() > 1024).unwrap_or(false))
+        .map(|(s, e)| ((s - init).max(0.0), (e - init).min(total_out).max(0.0)))
+        .filter(|(s, e)| e > s)
         .collect();
-    for bad in segments
-        .iter()
-        .filter(|s| !good.iter().any(|g| g.video == s.video))
-    {
-        cleanup(bad);
+
+    // merge + clamp paused spans, then take the complement = kept spans
+    let mut spans = spans;
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, e) in spans {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
     }
-    if good.is_empty() {
-        return Err(anyhow!("no valid segments"));
+    let mut kept: Vec<(f64, f64)> = Vec::new();
+    let mut cur = 0.0;
+    for (s, e) in &merged {
+        if *s > cur {
+            kept.push((cur, *s));
+        }
+        cur = cur.max(*e);
+    }
+    if cur < total_out {
+        kept.push((cur, total_out));
+    }
+    kept.retain(|(s, e)| e - s > 0.05);
+    if kept.is_empty() {
+        cleanup(raw);
+        return Err(anyhow!("nothing left after trim"));
     }
 
-    if good.len() == 1 {
-        std::fs::rename(&good[0].video, base)?;
-    } else {
-        let list = base.with_extension("concat.txt");
-        let mut text = String::new();
-        for s in &good {
-            text.push_str(&format!("file '{}'\n", s.video.display()));
-        }
-        std::fs::write(&list, text)?;
-        let ffmpeg = util::find_ffmpeg(cfg)?;
-        let status = Command::new(&ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                &list.display().to_string(),
-                "-c",
-                "copy",
-                "-y",
-                &base.display().to_string(),
-            ])
-            .creation_flags(0x0800_0000)
-            .status()?;
-        let _ = std::fs::remove_file(&list);
-        if !status.success() {
-            return Err(anyhow!("concat failed: {status}"));
+    let with_audio = cfg.audio;
+    let mut fc = String::new();
+    let mut inputs = String::new();
+    for (i, (s, e)) in kept.iter().enumerate() {
+        fc.push_str(&format!(
+            "[0:v]trim=start={s:.3}:end={e:.3},setpts=PTS-STARTPTS[v{i}];"
+        ));
+        if with_audio {
+            fc.push_str(&format!(
+                "[0:a]atrim=start={s:.3}:end={e:.3},asetpts=PTS-STARTPTS[a{i}];"
+            ));
+            inputs.push_str(&format!("[v{i}][a{i}]"));
+        } else {
+            inputs.push_str(&format!("[v{i}]"));
         }
     }
+    fc.push_str(&format!(
+        "{}concat=n={}:v=1:a={}[outv][outa]",
+        inputs,
+        kept.len(),
+        if with_audio { 1 } else { 0 }
+    ));
 
-    for s in segments {
-        cleanup(s);
+    let ffmpeg = util::find_ffmpeg(cfg)?;
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        raw.display().to_string(),
+        "-filter_complex".into(),
+        fc,
+        "-map".into(),
+        "[outv]".into(),
+    ];
+    if with_audio {
+        args.extend(["-map".into(), "[outa]".into()]);
     }
+    args.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-crf".into(),
+        "20".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+    ]);
+    if with_audio {
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{}K", cfg.audio_bitrate_kbps),
+        ]);
+    }
+    args.extend(["-y".into(), base.display().to_string()]);
+
+    let status = Command::new(&ffmpeg)
+        .args(&args)
+        .creation_flags(0x0800_0000)
+        .status()?;
+    if !status.success() {
+        cleanup(raw);
+        return Err(anyhow!("trim failed: {status}"));
+    }
+    cleanup(raw);
     Ok(())
 }
 
-fn cleanup(s: &SegEntry) {
-    let _ = std::fs::remove_file(&s.video);
-    if let (Some(dir), Some(name)) = (s.video.parent(), s.video.file_stem()) {
+fn ffprobe_duration(cfg: &Config, path: &Path) -> Result<f64> {
+    let ffprobe = util::find_ffmpeg(cfg)?.with_file_name("ffprobe.exe");
+    let out = Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            &path.display().to_string(),
+        ])
+        .creation_flags(0x0800_0000)
+        .output()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    s.parse::<f64>()
+        .map_err(|_| anyhow!("ffprobe could not read duration of {path:?}"))
+}
+
+fn cleanup(raw: &Path) {
+    let _ = std::fs::remove_file(raw);
+    if let (Some(dir), Some(name)) = (raw.parent(), raw.file_stem()) {
         let prefix = format!("{}.", name.to_string_lossy());
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {

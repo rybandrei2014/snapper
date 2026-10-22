@@ -61,8 +61,8 @@ $hwnd = [W]::FindWindowW("SnapperOverlay", $null)
 [W]::ClickButton("Record")
 Start-Sleep 1
 
-"[4] recording 3s"
-Start-Sleep 3
+"[4] recording 3s (jiggle mouse so ddagrab produces frames)"
+0..6 | ForEach-Object { [Inj]::Move(600 + ($_ % 2) * 40, 500); Start-Sleep -Milliseconds 400 }
 
 "[5] ctl bar: Pause, wait 2s, Resume"
 $ctl = [W]::FindWindowW("SnapperCtl", $null)
@@ -70,7 +70,7 @@ $ctl = [W]::FindWindowW("SnapperCtl", $null)
 [W]::ClickButton("Pause")
 Start-Sleep 2
 [W]::ClickButton("Resume")
-Start-Sleep 3
+0..6 | ForEach-Object { [Inj]::Move(600 + ($_ % 2) * 40, 500); Start-Sleep -Milliseconds 400 }
 
 "[6] ctl bar: Stop"
 [W]::ClickButton("Stop")

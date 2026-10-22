@@ -38,7 +38,6 @@ enum Mode {
     Selecting,
     Choosing,
     Recording,
-    Pausing,
     Paused,
     Stopping,
 }
@@ -59,12 +58,12 @@ struct App {
 }
 
 struct Recording {
-    params: capture::SegParams,
     base: PathBuf,
-    segments: Vec<capture::SegEntry>,
-    seq: u32,
+    raw: PathBuf,
     seg: Option<capture::Segment>,
-    retried: bool,
+    paused_wall: Vec<(f64, f64)>,
+    pause_start_wall: Option<f64>,
+    total_wall: f64,
 }
 
 struct MenuItems {
@@ -231,14 +230,22 @@ fn main() -> Result<()> {
         }
     }
 
-    // quitting while recording: finish current segment and salvage the file
+    // quitting while recording: stop ffmpeg and salvage the file
     if let Some(rec) = app.recording.as_mut() {
+        let mut total_wall = rec.total_wall;
         if let Some(seg) = rec.seg.as_mut() {
+            if total_wall == 0.0 {
+                total_wall = seg.elapsed();
+            }
             seg.stop_signal();
             std::thread::sleep(Duration::from_millis(500));
         }
         rec.seg = None;
-        let _ = capture::finalize(&app.cfg, &rec.base, &rec.segments);
+        let mut paused = rec.paused_wall.clone();
+        if let Some(ps) = rec.pause_start_wall {
+            paused.push((ps, total_wall));
+        }
+        let _ = capture::finalize(&app.cfg, &rec.base, &rec.raw, &paused, total_wall);
     }
     Ok(())
 }
@@ -249,7 +256,7 @@ fn update_menu(mode: Mode, items: &MenuItems) {
     let _ = items.resume.set_enabled(mode == Mode::Paused);
     let _ = items
         .stop
-        .set_enabled(matches!(mode, Mode::Recording | Mode::Pausing | Mode::Paused | Mode::Stopping));
+        .set_enabled(matches!(mode, Mode::Recording | Mode::Paused | Mode::Stopping));
 }
 
 fn toggle_rec(app: &mut App, main: HWND, tray: &TrayIcon, items: &MenuItems) {
@@ -270,12 +277,7 @@ fn toggle_rec(app: &mut App, main: HWND, tray: &TrayIcon, items: &MenuItems) {
             app.mode = Mode::Idle;
             update_menu(app.mode, items);
         }
-        Mode::Paused => {
-            // stop while paused: finalize what we have
-            app.mode = Mode::Stopping;
-            update_menu(app.mode, items);
-            finalize(app, tray);
-        }
+        Mode::Paused => stop_rec(app, tray, items),
         _ => {}
     }
 }
@@ -285,10 +287,13 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
         Mode::Recording => {
             if let Some(rec) = app.recording.as_mut() {
                 if let Some(seg) = rec.seg.as_mut() {
-                    app.mode = Mode::Pausing;
+                    // ffmpeg keeps running; we just mark where the pause begins
+                    // on the wall clock and cut it out at stop.
+                    rec.pause_start_wall = Some(seg.elapsed());
+                    app.mode = Mode::Paused;
                     update_menu(app.mode, items);
-                    seg.stop_signal();
-                    let _ = tray.set_tooltip(Some("Snapper — pausing…"));
+                    overlay::update_ctl_pause(true);
+                    let _ = tray.set_tooltip(Some("Snapper — paused"));
                 }
             }
         }
@@ -297,22 +302,13 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
                 Some(r) => r,
                 None => return,
             };
-            rec.seq += 1;
-            let seg_path = segment_path(&rec.base, rec.seq);
-            let enc = if rec.retried { Some("libx264") } else { None };
-            match capture::start_segment(&app.cfg, rec.params, &seg_path, enc) {
-                Ok((seg, entry)) => {
-                    rec.segments.push(entry);
-                    rec.seg = Some(seg);
-                    app.mode = Mode::Recording;
-                    update_menu(app.mode, items);
-                    overlay::update_ctl_pause(false);
-                    let _ = tray.set_tooltip(Some("Snapper — recording"));
-                }
-                Err(e) => {
-                    let _ = tray.set_tooltip(Some(&format!("Snapper — resume failed: {e}")));
-                }
+            if let (Some(seg), Some(ps)) = (rec.seg.as_mut(), rec.pause_start_wall.take()) {
+                rec.paused_wall.push((ps, seg.elapsed()));
             }
+            app.mode = Mode::Recording;
+            update_menu(app.mode, items);
+            overlay::update_ctl_pause(false);
+            let _ = tray.set_tooltip(Some("Snapper — recording"));
         }
         _ => {}
     }
@@ -320,19 +316,14 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
 
 fn stop_rec(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
     match app.mode {
-        Mode::Recording => {}
-        Mode::Paused => {
-            app.mode = Mode::Stopping;
-            update_menu(app.mode, items);
-            finalize(app, tray);
-            return;
-        }
+        Mode::Recording | Mode::Paused => {}
         _ => return,
     }
     app.mode = Mode::Stopping;
     update_menu(app.mode, items);
     if let Some(rec) = app.recording.as_mut() {
         if let Some(seg) = rec.seg.as_mut() {
+            rec.total_wall = seg.elapsed();
             seg.stop_signal();
             let _ = tray.set_tooltip(Some("Snapper — stopping…"));
         } else {
@@ -341,8 +332,8 @@ fn stop_rec(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
     }
 }
 
-fn segment_path(base: &PathBuf, seq: u32) -> PathBuf {
-    base.with_extension(format!("seg{seq:03}.mp4"))
+fn raw_path(base: &PathBuf) -> PathBuf {
+    base.with_extension("raw.mp4")
 }
 
 fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon, items: &MenuItems) {
@@ -413,16 +404,16 @@ fn on_ctl(app: &mut App, id: usize, tray: &TrayIcon, items: &MenuItems) {
 }
 
 fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon, items: &MenuItems) {
-    let seg_path = segment_path(&pend.base, 0);
-    match capture::start_segment(&app.cfg, pend.params, &seg_path, None) {
-        Ok((seg, entry)) => {
+    let raw = raw_path(&pend.base);
+    match capture::start_segment(&app.cfg, pend.params, &raw, None) {
+        Ok(seg) => {
             app.recording = Some(Recording {
-                params: pend.params,
                 base: pend.base,
-                segments: vec![entry],
-                seq: 0,
+                raw,
                 seg: Some(seg),
-                retried: false,
+                paused_wall: Vec::new(),
+                pause_start_wall: None,
+                total_wall: 0.0,
             });
             app.mode = Mode::Recording;
             update_menu(app.mode, items);
@@ -455,7 +446,7 @@ fn take_screenshot(app: &mut App, pend: &PendingSel, tray: &TrayIcon) {
     }
 }
 
-fn poll_segment(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
+fn poll_segment(app: &mut App, tray: &TrayIcon, _items: &MenuItems) {
     let rec = match app.recording.as_mut() {
         Some(r) => r,
         None => return,
@@ -464,54 +455,23 @@ fn poll_segment(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
         Some(s) => s,
         None => return,
     };
-    let done = match seg.try_done() {
-        Ok(Some(code)) => Some(code),
+    match seg.try_done() {
         Ok(None) => return,
+        Ok(Some(code)) => {
+            if rec.total_wall == 0.0 {
+                rec.total_wall = seg.elapsed();
+            }
+            rec.seg = None;
+            if code != 0 && app.mode == Mode::Recording {
+                let _ = tray.set_tooltip(Some(&format!("Snapper — capture stopped ({code})")));
+            }
+            finalize(app, tray);
+        }
         Err(e) => {
-            eprintln!("[app] segment wait error: {e}");
-            Some(1)
+            eprintln!("[app] capture wait error: {e}");
+            rec.seg = None;
+            finalize(app, tray);
         }
-    };
-    let code = match done {
-        Some(c) => c,
-        None => return,
-    };
-    rec.seg = None;
-    if code != 0 && app.mode == Mode::Recording {
-        // ffmpeg died on its own: retry the segment once with a software encoder
-        if !rec.retried {
-            rec.retried = true;
-            if let Some(bad) = rec.segments.pop() {
-                let _ = std::fs::remove_file(&bad.video);
-                let _ = std::fs::remove_file(bad.video.with_extension("ffmpeg.log"));
-            }
-            eprintln!("[app] segment crashed, retrying with libx264");
-            let seg_path = segment_path(&rec.base, rec.seq);
-            match capture::start_segment(&app.cfg, rec.params, &seg_path, Some("libx264")) {
-                Ok((seg, entry)) => {
-                    rec.segments.push(entry);
-                    rec.seg = Some(seg);
-                    let _ = tray.set_tooltip(Some("Snapper — recording (recovered)"));
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[app] retry failed: {e}");
-                }
-            }
-        }
-        let _ = tray.set_tooltip(Some(&format!("Snapper — capture failed ({code})")));
-        finalize(app, tray);
-        return;
-    }
-    match app.mode {
-        Mode::Stopping => finalize(app, tray),
-        Mode::Pausing => {
-            app.mode = Mode::Paused;
-            update_menu(app.mode, items);
-            overlay::update_ctl_pause(true);
-            let _ = tray.set_tooltip(Some("Snapper — paused"));
-        }
-        _ => {}
     }
 }
 
@@ -525,7 +485,12 @@ fn finalize(app: &mut App, tray: &TrayIcon) {
             return;
         }
     };
-    match capture::finalize(&app.cfg, &rec.base, &rec.segments) {
+    let mut paused = rec.paused_wall.clone();
+    // stopping while paused: the open pause runs to the end → cut it too
+    if let Some(ps) = rec.pause_start_wall {
+        paused.push((ps, rec.total_wall));
+    }
+    match capture::finalize(&app.cfg, &rec.base, &rec.raw, &paused, rec.total_wall) {
         Ok(()) => {
             app.last_out = Some(rec.base.clone());
             let label = rec
