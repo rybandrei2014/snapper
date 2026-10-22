@@ -142,6 +142,8 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - [x] Region screenshot (Snipping-Tool style): same drag-select, then a Record/Screenshot chooser;
       screenshot = `ddagrab -frames:v 1` → PNG in `screenshot_dir` (defaults to `output_dir`) ✅
       verified: 801×501 region → 801×501 PNG (`test_shot.ps1`)
+- [x] Floating control bar during recording (Pause/Resume · Stop) anchored just outside the
+      region, in addition to the hotkey and tray menu ✅ verified via `e2e_test.ps1` button clicks
 - [ ] Per-source volume knobs in settings
 - [ ] Countdown timer, re-select-last-region (`Win+Shift+G`)
 - [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV

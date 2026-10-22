@@ -25,8 +25,9 @@ public class W {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
   public static void ClickButton(string name){
-    IntPtr bar = FindWindowW("SnapperAction", null);
-    if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no action bar window"); return; }
+    IntPtr bar = FindWindowW("SnapperCtl", null);
+    if(bar==IntPtr.Zero) bar = FindWindowW("SnapperAction", null);
+    if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no button bar window"); return; }
     IntPtr btn = FindWindowExW(bar, IntPtr.Zero, "BUTTON", name);
     if(btn==IntPtr.Zero){ Console.WriteLine("    WARN: no button '" + name + "'"); return; }
     SendMessageW(btn, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
@@ -63,14 +64,16 @@ Start-Sleep 1
 "[4] recording 3s"
 Start-Sleep 3
 
-"[5] pause (Win+Alt+P), wait 2s, resume"
-[Inj]::HotkeyP()
+"[5] ctl bar: Pause, wait 2s, Resume"
+$ctl = [W]::FindWindowW("SnapperCtl", $null)
+"    ctl bar hwnd: $ctl"
+[W]::ClickButton("Pause")
 Start-Sleep 2
-[Inj]::HotkeyP()
+[W]::ClickButton("Resume")
 Start-Sleep 3
 
-"[6] hotkey -> stop"
-[Inj]::Hotkey()
+"[6] ctl bar: Stop"
+[W]::ClickButton("Stop")
 Start-Sleep 3
 
 Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue

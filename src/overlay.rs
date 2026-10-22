@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_APP_SELECTION: u32 = 0x8001;
 pub const WM_APP_ACTION: u32 = 0x8002;
+pub const WM_APP_CTL: u32 = 0x8003;
 
 const DIM: u32 = 0x8000_0000; // black, alpha 128 (premultiplied)
 const RED: u32 = 0xFF00_00FF; // opaque red (premultiplied)
@@ -63,6 +64,9 @@ static BORDER: Mutex<Option<BorderState>> = Mutex::new(None);
 static RESULT: Mutex<Option<RECT>> = Mutex::new(None);
 static ACTION_HWND: AtomicIsize = AtomicIsize::new(0);
 static ACTION_MAIN: AtomicIsize = AtomicIsize::new(0);
+static CTL_HWND: AtomicIsize = AtomicIsize::new(0);
+static CTL_MAIN: AtomicIsize = AtomicIsize::new(0);
+static CTL_PAUSE_BTN: AtomicIsize = AtomicIsize::new(0);
 
 pub fn take_result() -> Option<RECT> {
     RESULT.lock().unwrap().take()
@@ -109,6 +113,19 @@ pub fn register_class() -> Result<()> {
         };
         if RegisterClassExW(&wc) == 0 {
             return Err(anyhow::anyhow!("RegisterClassExW action failed"));
+        }
+
+        let cls = wide("SnapperCtl");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(ctl_wndproc),
+            hInstance: hinst.into(),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(anyhow::anyhow!("RegisterClassExW ctl failed"));
         }
     }
     Ok(())
@@ -486,6 +503,110 @@ unsafe extern "system" fn action_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, _lp: 
                 ACTION_HWND.store(0, Ordering::SeqCst);
                 let _ = DestroyWindow(hwnd);
                 let _ = PostMessageW(main, WM_APP_ACTION, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, _lp),
+    }
+}
+
+/// Floating control bar anchored just outside the recording region:
+/// Pause/Resume + Stop. Posts WM_APP_CTL (1 = pause toggle, 2 = stop).
+pub fn show_ctl_bar(main: HWND, rect: RECT) {
+    unsafe {
+        CTL_MAIN.store(main.0 as isize, Ordering::SeqCst);
+        let bar_w = 168i32;
+        let bar_h = 36i32;
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let mut x = rect.right - bar_w;
+        let mut y = rect.top - bar_h - 8;
+        if y < vy {
+            y = (rect.bottom + 8).min(vy + vh - bar_h);
+        }
+        x = x.clamp(vx, (vx + vw - bar_w).max(vx));
+
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let cls = wide("SnapperCtl");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            PCWSTR(cls.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            bar_w,
+            bar_h,
+            HWND::default(),
+            HMENU::default(),
+            hinst,
+            None,
+        );
+        let Ok(hwnd) = hwnd else { return };
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let btn_cls = wide("BUTTON");
+        let mut mk = |label: &str, id: usize, bx: i32| {
+            let w = wide(label);
+            let b = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(btn_cls.as_ptr()),
+                PCWSTR(w.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                bx,
+                6,
+                76,
+                24,
+                hwnd,
+                HMENU(id as *mut c_void),
+                hinst,
+                None,
+            );
+            if let Ok(b) = b {
+                let _ = SendMessageW(b, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                if id == 1 {
+                    CTL_PAUSE_BTN.store(b.0 as isize, Ordering::SeqCst);
+                }
+            }
+        };
+        mk("Pause", 1, 6);
+        mk("Stop", 2, 86);
+
+        CTL_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+    }
+}
+
+pub fn update_ctl_pause(paused: bool) {
+    let btn = CTL_PAUSE_BTN.load(Ordering::SeqCst);
+    if btn == 0 {
+        return;
+    }
+    let label = wide(if paused { "Resume" } else { "Pause" });
+    unsafe {
+        let _ = SetWindowTextW(HWND(btn as *mut c_void), PCWSTR(label.as_ptr()));
+    }
+}
+
+pub fn hide_ctl_bar() {
+    CTL_PAUSE_BTN.store(0, Ordering::SeqCst);
+    let h = CTL_HWND.swap(0, Ordering::SeqCst);
+    if h != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(h as *mut c_void));
+        }
+    }
+}
+
+unsafe extern "system" fn ctl_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, _lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = (wp.0 & 0xFFFF) as u16;
+            let code = ((wp.0 >> 16) & 0xFFFF) as u16;
+            if code == 0 {
+                let main = HWND(CTL_MAIN.load(Ordering::SeqCst) as *mut c_void);
+                let _ = PostMessageW(main, WM_APP_CTL, WPARAM(id as usize), LPARAM(0));
             }
             LRESULT(0)
         }

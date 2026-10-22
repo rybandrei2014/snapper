@@ -19,9 +19,10 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
 1. Make sure `ffmpeg.exe` (6.1+, 7.x recommended) is next to `snapper.exe` or on PATH.
 2. Run `snapper.exe` — it lives in the system tray (starts minimized, no window).
 3. `Win+Shift+R` → screen dims → drag a region → a small **Record / Screenshot** bar appears.
-4. **Record**: recording starts (red border). `Win+Alt+P` pauses/resumes (falls back to
-   `Ctrl+Alt+P` if taken; `Win+Shift+P` is the Windows display-switch hotkey and is deliberately
-   not used). `Win+Shift+R` again (or tray → Stop) finishes.
+4. **Record**: recording starts (red border) and a small floating **Pause/Resume · Stop** bar
+   appears just outside the region. `Win+Alt+P` also pauses/resumes (falls back to `Ctrl+Alt+P` if
+   taken; `Win+Shift+P` is the Windows display-switch hotkey and is deliberately not used).
+   `Win+Shift+R` again (or the bar / tray → Stop) finishes.
 5. **Screenshot**: writes a single PNG of the region.
 6. `Esc` / right-click cancels selection; `Esc` (or `Win+Shift+R`) dismisses the chooser.
 7. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4` / `.png`.
@@ -71,7 +72,8 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   exists, and muxed to AAC. If a source fails, recording degrades (mic-only failure → system
   audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
-  selection overlay and the click-through recording border; `tray-icon` for the tray;
+  selection overlay and the click-through recording border; a topmost floating control bar
+  (Pause/Resume · Stop) anchored just outside the region; `tray-icon` for the tray;
   `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
 - **Stop / pause:** `q` is written to ffmpeg's stdin, producing a clean, valid MP4; completion is
   detected by polling the child process from the message loop. Pause simply ends the current

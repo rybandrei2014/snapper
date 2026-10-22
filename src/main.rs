@@ -28,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub use overlay::{WM_APP_ACTION, WM_APP_SELECTION};
+pub use overlay::{WM_APP_ACTION, WM_APP_CTL, WM_APP_SELECTION};
 const HOTKEY_REC: i32 = 1;
 const HOTKEY_PAUSE: i32 = 2;
 
@@ -204,7 +204,8 @@ fn main() -> Result<()> {
                     _ => {}
                 },
                 WM_APP_SELECTION => on_selection(&mut app, msg.wParam.0, main, &tray, &items),
-                WM_APP_ACTION => on_action(&mut app, msg.wParam.0, &tray, &items),
+                WM_APP_ACTION => on_action(&mut app, msg.wParam.0, main, &tray, &items),
+                WM_APP_CTL => on_ctl(&mut app, msg.wParam.0, &tray, &items),
                 _ => {
                     unsafe {
                         let _ = TranslateMessage(&msg);
@@ -309,6 +310,7 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
                     rec.seg = Some(seg);
                     app.mode = Mode::Recording;
                     update_menu(app.mode, items);
+                    overlay::update_ctl_pause(false);
                     let _ = tray.set_tooltip(Some("Snapper — recording"));
                 }
                 Err(e) => {
@@ -321,8 +323,15 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
 }
 
 fn stop_rec(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
-    if app.mode != Mode::Recording {
-        return;
+    match app.mode {
+        Mode::Recording => {}
+        Mode::Paused => {
+            app.mode = Mode::Stopping;
+            update_menu(app.mode, items);
+            finalize(app, tray);
+            return;
+        }
+        _ => return,
     }
     app.mode = Mode::Stopping;
     update_menu(app.mode, items);
@@ -381,7 +390,7 @@ fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon, items: &M
     overlay::show_action_bar(main, rect);
 }
 
-fn on_action(app: &mut App, choice: usize, tray: &TrayIcon, items: &MenuItems) {
+fn on_action(app: &mut App, choice: usize, main: HWND, tray: &TrayIcon, items: &MenuItems) {
     overlay::hide_action_bar();
     let Some(pend) = app.pending.take() else {
         app.mode = Mode::Idle;
@@ -391,7 +400,7 @@ fn on_action(app: &mut App, choice: usize, tray: &TrayIcon, items: &MenuItems) {
     app.mode = Mode::Idle;
     update_menu(app.mode, items);
     match choice {
-        1 => start_recording(app, pend, tray, items),
+        1 => start_recording(app, pend, main, tray, items),
         2 => take_screenshot(app, &pend, tray),
         _ => {
             let _ = tray.set_tooltip(Some("Snapper — cancelled"));
@@ -399,7 +408,15 @@ fn on_action(app: &mut App, choice: usize, tray: &TrayIcon, items: &MenuItems) {
     }
 }
 
-fn start_recording(app: &mut App, pend: PendingSel, tray: &TrayIcon, items: &MenuItems) {
+fn on_ctl(app: &mut App, id: usize, tray: &TrayIcon, items: &MenuItems) {
+    match id {
+        1 => toggle_pause(app, tray, items),
+        2 => stop_rec(app, tray, items),
+        _ => {}
+    }
+}
+
+fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon, items: &MenuItems) {
     let seg_path = segment_path(&pend.base, 0);
     match capture::start_segment(&app.cfg, pend.params, &seg_path, None) {
         Ok((seg, entry, fmt)) => {
@@ -415,6 +432,7 @@ fn start_recording(app: &mut App, pend: PendingSel, tray: &TrayIcon, items: &Men
             app.mode = Mode::Recording;
             update_menu(app.mode, items);
             overlay::show_border(pend.rect);
+            overlay::show_ctl_bar(main, pend.rect);
             let _ = tray.set_tooltip(Some(format!("Snapper — recording ({})", pend.name)));
         }
         Err(e) => {
@@ -501,6 +519,7 @@ fn poll_segment(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
         Mode::Pausing => {
             app.mode = Mode::Paused;
             update_menu(app.mode, items);
+            overlay::update_ctl_pause(true);
             let _ = tray.set_tooltip(Some("Snapper — paused"));
         }
         _ => {}
@@ -509,6 +528,7 @@ fn poll_segment(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
 
 fn finalize(app: &mut App, tray: &TrayIcon) {
     overlay::hide_border();
+    overlay::hide_ctl_bar();
     let rec = match app.recording.take() {
         Some(r) => r,
         None => {
