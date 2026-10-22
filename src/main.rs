@@ -6,14 +6,15 @@ mod audio;
 mod capture;
 mod config;
 mod overlay;
+mod theme;
+mod ui;
 mod util;
 
 use anyhow::{Context, Result};
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::time::Duration;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use std::time::{Duration, Instant};
+use tray_icon::{Icon, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     HWND, LPARAM, LRESULT, WPARAM, ERROR_ALREADY_EXISTS, GetLastError,
@@ -29,6 +30,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub use overlay::{WM_APP_ACTION, WM_APP_CTL, WM_APP_SELECTION};
+pub use ui::WM_APP_MENU;
 const HOTKEY_REC: i32 = 1;
 const HOTKEY_PAUSE: i32 = 2;
 
@@ -55,6 +57,7 @@ struct App {
     recording: Option<Recording>,
     pending: Option<PendingSel>,
     last_out: Option<PathBuf>,
+    pause_label: String,
 }
 
 struct Recording {
@@ -66,36 +69,31 @@ struct Recording {
     total_wall: f64,
 }
 
-struct MenuItems {
-    start: MenuItem,
-    pause: MenuItem,
-    resume: MenuItem,
-    stop: MenuItem,
-    open: MenuItem,
-    quit: MenuItem,
-}
-
 unsafe extern "system" fn main_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
-fn make_tray_icon() -> Icon {
-    let size = 32usize;
-    let mut rgba = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            if (dx * dx + dy * dy).sqrt() <= 13.5 {
-                let i = (y * size + x) * 4;
-                rgba[i] = 225;
-                rgba[i + 1] = 40;
-                rgba[i + 2] = 40;
-                rgba[i + 3] = 255;
-            }
-        }
+fn tray_state(mode: Mode) -> u8 {
+    match mode {
+        Mode::Recording => 1,
+        Mode::Paused => 2,
+        _ => 0,
     }
-    Icon::from_rgba(rgba, size as u32, size as u32).expect("icon")
+}
+
+fn make_tray_icon(mode: Mode) -> Icon {
+    unsafe {
+        let sc = theme::scale_primary();
+        let size = ((GetSystemMetrics(SM_CXSMICON)) as f32 * sc)
+            .round()
+            .max(16.0) as i32;
+        let rgba = ui::render_tray_icon(tray_state(mode), size);
+        Icon::from_rgba(rgba, size as u32, size as u32).expect("icon")
+    }
+}
+
+fn sync_tray(mode: Mode, tray: &TrayIcon) {
+    let _ = tray.set_icon(Some(make_tray_icon(mode)));
 }
 
 fn main() -> Result<()> {
@@ -116,6 +114,7 @@ fn main() -> Result<()> {
         recording: None,
         pending: None,
         last_out: None,
+        pause_label: String::new(),
     };
 
     let hinst = unsafe { GetModuleHandleW(None) }?;
@@ -162,48 +161,43 @@ fn main() -> Result<()> {
             break;
         }
     }
-    let pause_label = pause_label.unwrap_or("Win+Shift+P");
-    eprintln!("[app] pause hotkey: {pause_label}");
+    app.pause_label = pause_label.unwrap_or("Win+Shift+P").to_string();
+    eprintln!("[app] pause hotkey: {}", app.pause_label);
     overlay::register_class()?;
+    ui::register_class()?;
 
-    let menu = Menu::new();
-    let items = MenuItems {
-        start: MenuItem::new("Start recording  (Win+Shift+R)", true, None),
-        pause: MenuItem::new(&format!("Pause  ({pause_label})"), false, None),
-        resume: MenuItem::new(&format!("Resume ({pause_label})"), false, None),
-        stop: MenuItem::new("Stop", false, None),
-        open: MenuItem::new("Open output folder", true, None),
-        quit: MenuItem::new("Quit", true, None),
-    };
-    let sep = PredefinedMenuItem::separator();
-    let _ = menu.append(&items.start);
-    let _ = menu.append(&items.pause);
-    let _ = menu.append(&items.resume);
-    let _ = menu.append(&items.stop);
-    let _ = menu.append(&sep);
-    let _ = menu.append(&items.open);
-    let _ = menu.append(&items.quit);
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
         .with_tooltip("Snapper — Win+Shift+R to record")
-        .with_icon(make_tray_icon())
+        .with_icon(make_tray_icon(Mode::Idle))
         .build()
         .map_err(|e| anyhow::anyhow!("tray: {e:?}"))?;
 
     let mut msg = MSG::default();
+    let mut last_tick = Instant::now();
     loop {
         let got = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) };
         if got.as_bool() {
             match msg.message {
                 WM_QUIT => break,
                 WM_HOTKEY => match msg.wParam.0 as i32 {
-                    HOTKEY_REC => toggle_rec(&mut app, main, &tray, &items),
-                    HOTKEY_PAUSE => toggle_pause(&mut app, &tray, &items),
+                    HOTKEY_REC => {
+                        ui::hide_menu();
+                        toggle_rec(&mut app, main, &tray)
+                    }
+                    HOTKEY_PAUSE => toggle_pause(&mut app, &tray),
                     _ => {}
                 },
-                WM_APP_SELECTION => on_selection(&mut app, msg.wParam.0, main, &tray, &items),
-                WM_APP_ACTION => on_action(&mut app, msg.wParam.0, main, &tray, &items),
-                WM_APP_CTL => on_ctl(&mut app, msg.wParam.0, &tray, &items),
+                WM_APP_SELECTION => on_selection(&mut app, msg.wParam.0, main, &tray),
+                WM_APP_ACTION => on_action(&mut app, msg.wParam.0, main, &tray),
+                WM_APP_CTL => on_ctl(&mut app, msg.wParam.0, &tray),
+                WM_APP_MENU => match msg.wParam.0 {
+                    1 => toggle_rec(&mut app, main, &tray),
+                    2 | 3 => toggle_pause(&mut app, &tray),
+                    4 => stop_rec(&mut app, &tray),
+                    5 => open_folder(&app),
+                    6 => break,
+                    _ => {}
+                },
                 _ => {
                     unsafe {
                         let _ = TranslateMessage(&msg);
@@ -212,23 +206,27 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            poll_segment(&mut app, &tray, &items);
-            if let Ok(ev) = MenuEvent::receiver().try_recv() {
-                if ev.id() == items.start.id() {
-                    toggle_rec(&mut app, main, &tray, &items);
-                } else if ev.id() == items.pause.id() || ev.id() == items.resume.id() {
-                    toggle_pause(&mut app, &tray, &items);
-                } else if ev.id() == items.stop.id() {
-                    stop_rec(&mut app, &tray, &items);
-                } else if ev.id() == items.open.id() {
-                    open_folder(&app);
-                } else if ev.id() == items.quit.id() {
-                    break;
+            poll_segment(&mut app, &tray);
+            if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::Click {
+                    button_state: MouseButtonState::Down,
+                    ..
+                } = ev
+                {
+                    ui::show_menu(
+                        main,
+                        app.mode == Mode::Idle,
+                        app.mode == Mode::Recording,
+                        app.mode == Mode::Paused,
+                        &app.pause_label.clone(),
+                    );
                 }
             }
+            tick_timer(&mut app, &mut last_tick);
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    ui::hide_menu();
 
     // quitting while recording: stop ffmpeg and salvage the file
     if let Some(rec) = app.recording.as_mut() {
@@ -250,39 +248,50 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn update_menu(mode: Mode, items: &MenuItems) {
-    let _ = items.start.set_enabled(mode == Mode::Idle);
-    let _ = items.pause.set_enabled(mode == Mode::Recording);
-    let _ = items.resume.set_enabled(mode == Mode::Paused);
-    let _ = items
-        .stop
-        .set_enabled(matches!(mode, Mode::Recording | Mode::Paused | Mode::Stopping));
+fn tick_timer(app: &mut App, last_tick: &mut Instant) {
+    if !matches!(app.mode, Mode::Recording | Mode::Paused) {
+        return;
+    }
+    if last_tick.elapsed() < Duration::from_millis(500) {
+        return;
+    }
+    *last_tick = Instant::now();
+    let Some(rec) = app.recording.as_mut() else {
+        return;
+    };
+    let Some(seg) = rec.seg.as_mut() else {
+        return;
+    };
+    // freeze the readout at the pause point while paused
+    let e = rec.pause_start_wall.unwrap_or_else(|| seg.elapsed());
+    let t = format!("{}:{:02}", (e / 60.0) as u32, (e as u32) % 60);
+    ui::ctl_set_state(app.mode == Mode::Paused, Some(&t));
 }
 
-fn toggle_rec(app: &mut App, main: HWND, tray: &TrayIcon, items: &MenuItems) {
+fn toggle_rec(app: &mut App, main: HWND, tray: &TrayIcon) {
     match app.mode {
         Mode::Idle => {
             app.mode = Mode::Selecting;
-            update_menu(app.mode, items);
+            sync_tray(app.mode, tray);
             if let Err(e) = overlay::show(main) {
                 eprintln!("overlay: {e}");
                 app.mode = Mode::Idle;
-                update_menu(app.mode, items);
+                sync_tray(app.mode, tray);
             }
         }
-        Mode::Recording => stop_rec(app, tray, items),
+        Mode::Recording => stop_rec(app, tray),
         Mode::Choosing => {
-            overlay::hide_action_bar();
+            ui::hide_action_bar();
             app.pending = None;
             app.mode = Mode::Idle;
-            update_menu(app.mode, items);
+            sync_tray(app.mode, tray);
         }
-        Mode::Paused => stop_rec(app, tray, items),
+        Mode::Paused => stop_rec(app, tray),
         _ => {}
     }
 }
 
-fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
+fn toggle_pause(app: &mut App, tray: &TrayIcon) {
     match app.mode {
         Mode::Recording => {
             if let Some(rec) = app.recording.as_mut() {
@@ -291,8 +300,8 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
                     // on the wall clock and cut it out at stop.
                     rec.pause_start_wall = Some(seg.elapsed());
                     app.mode = Mode::Paused;
-                    update_menu(app.mode, items);
-                    overlay::update_ctl_pause(true);
+                    sync_tray(app.mode, tray);
+                    ui::ctl_set_state(true, None);
                     let _ = tray.set_tooltip(Some("Snapper — paused"));
                 }
             }
@@ -306,21 +315,21 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
                 rec.paused_wall.push((ps, seg.elapsed()));
             }
             app.mode = Mode::Recording;
-            update_menu(app.mode, items);
-            overlay::update_ctl_pause(false);
+            sync_tray(app.mode, tray);
+            ui::ctl_set_state(false, None);
             let _ = tray.set_tooltip(Some("Snapper — recording"));
         }
         _ => {}
     }
 }
 
-fn stop_rec(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
+fn stop_rec(app: &mut App, tray: &TrayIcon) {
     match app.mode {
         Mode::Recording | Mode::Paused => {}
         _ => return,
     }
     app.mode = Mode::Stopping;
-    update_menu(app.mode, items);
+    sync_tray(app.mode, tray);
     if let Some(rec) = app.recording.as_mut() {
         if let Some(seg) = rec.seg.as_mut() {
             rec.total_wall = seg.elapsed();
@@ -336,9 +345,9 @@ fn raw_path(base: &PathBuf) -> PathBuf {
     base.with_extension("raw.mp4")
 }
 
-fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon, items: &MenuItems) {
+fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon) {
     app.mode = Mode::Idle;
-    update_menu(app.mode, items);
+    sync_tray(app.mode, tray);
     if ok == 0 {
         return;
     }
@@ -372,22 +381,22 @@ fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon, items: &M
         name,
     });
     app.mode = Mode::Choosing;
-    update_menu(app.mode, items);
+    sync_tray(app.mode, tray);
     let _ = tray.set_tooltip(Some("Snapper — Record or Screenshot? (Esc cancels)"));
-    overlay::show_action_bar(main, rect);
+    ui::show_action_bar(main, rect);
 }
 
-fn on_action(app: &mut App, choice: usize, main: HWND, tray: &TrayIcon, items: &MenuItems) {
-    overlay::hide_action_bar();
+fn on_action(app: &mut App, choice: usize, main: HWND, tray: &TrayIcon) {
+    ui::hide_action_bar();
     let Some(pend) = app.pending.take() else {
         app.mode = Mode::Idle;
-        update_menu(app.mode, items);
+        sync_tray(app.mode, tray);
         return;
     };
     app.mode = Mode::Idle;
-    update_menu(app.mode, items);
+    sync_tray(app.mode, tray);
     match choice {
-        1 => start_recording(app, pend, main, tray, items),
+        1 => start_recording(app, pend, main, tray),
         2 => take_screenshot(app, &pend, tray),
         _ => {
             let _ = tray.set_tooltip(Some("Snapper — cancelled"));
@@ -395,16 +404,20 @@ fn on_action(app: &mut App, choice: usize, main: HWND, tray: &TrayIcon, items: &
     }
 }
 
-fn on_ctl(app: &mut App, id: usize, tray: &TrayIcon, items: &MenuItems) {
+fn on_ctl(app: &mut App, id: usize, tray: &TrayIcon) {
     match id {
-        1 => toggle_pause(app, tray, items),
-        2 => stop_rec(app, tray, items),
+        1 => toggle_pause(app, tray),
+        2 => stop_rec(app, tray),
         _ => {}
     }
 }
 
-fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon, items: &MenuItems) {
+fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon) {
     let raw = raw_path(&pend.base);
+    // instant feedback: border + control bar BEFORE ffmpeg spawns, so the
+    // user never sees a "nothing happened" gap that then lands in the video
+    overlay::show_border(pend.rect);
+    ui::show_ctl_bar(main, pend.rect);
     match capture::start_segment(&app.cfg, pend.params, &raw, None) {
         Ok(seg) => {
             app.recording = Some(Recording {
@@ -416,12 +429,12 @@ fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon,
                 total_wall: 0.0,
             });
             app.mode = Mode::Recording;
-            update_menu(app.mode, items);
-            overlay::show_border(pend.rect);
-            overlay::show_ctl_bar(main, pend.rect);
+            sync_tray(app.mode, tray);
             let _ = tray.set_tooltip(Some(format!("Snapper — recording ({})", pend.name)));
         }
         Err(e) => {
+            overlay::hide_border();
+            ui::hide_ctl_bar();
             eprintln!("capture: {e}");
             let _ = tray.set_tooltip(Some(format!("Snapper — error: {e}")));
         }
@@ -446,7 +459,7 @@ fn take_screenshot(app: &mut App, pend: &PendingSel, tray: &TrayIcon) {
     }
 }
 
-fn poll_segment(app: &mut App, tray: &TrayIcon, _items: &MenuItems) {
+fn poll_segment(app: &mut App, tray: &TrayIcon) {
     let rec = match app.recording.as_mut() {
         Some(r) => r,
         None => return,
@@ -477,7 +490,7 @@ fn poll_segment(app: &mut App, tray: &TrayIcon, _items: &MenuItems) {
 
 fn finalize(app: &mut App, tray: &TrayIcon) {
     overlay::hide_border();
-    overlay::hide_ctl_bar();
+    ui::hide_ctl_bar();
     let rec = match app.recording.take() {
         Some(r) => r,
         None => {
@@ -493,12 +506,12 @@ fn finalize(app: &mut App, tray: &TrayIcon) {
     match capture::finalize(&app.cfg, &rec.base, &rec.raw, &paused, rec.total_wall) {
         Ok(()) => {
             app.last_out = Some(rec.base.clone());
-            let label = rec
+            let fname = rec
                 .base
                 .file_name()
-                .map(|n| format!("Snapper — saved {}", n.to_string_lossy()))
-                .unwrap_or_else(|| "Snapper — saved".into());
-            let _ = tray.set_tooltip(Some(&label));
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let _ = tray.set_tooltip(Some(&format!("Snapper — saved {fname}")));
         }
         Err(e) => {
             eprintln!("finalize: {e}");

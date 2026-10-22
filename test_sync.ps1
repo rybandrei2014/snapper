@@ -26,9 +26,8 @@ public class W {
     IntPtr bar = FindWindowW("SnapperCtl", null);
     if(bar==IntPtr.Zero) bar = FindWindowW("SnapperAction", null);
     if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no button bar window"); return; }
-    IntPtr btn = FindWindowExW(bar, IntPtr.Zero, "BUTTON", name);
-    if(btn==IntPtr.Zero){ Console.WriteLine("    WARN: no button '" + name + "'"); return; }
-    SendMessageW(btn, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+    int id = name=="Record" ? 1 : name=="Screenshot" ? 2 : name=="Stop" ? 2 : 1; // Pause/Resume=1
+    SendMessageW(bar, 0x8010, (IntPtr)id, IntPtr.Zero); // WM_SNAP_CLICK
   }
 }
 "@

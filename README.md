@@ -73,9 +73,11 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   timestamps keep tracking wall-clock time. If a source fails, recording degrades (mic-only failure →
   system audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
-  selection overlay and the click-through recording border; a topmost floating control bar
-  (Pause/Resume · Stop) anchored just outside the region; `tray-icon` for the tray;
-  `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
+  selection overlay (hairline edge + live size badge, fade-in) and the click-through recording
+  border (thin accent line + soft glow); Direct2D/DirectWrite-rendered dark capsule bars
+  (Record/Screenshot chooser, Pause/Stop + live timer) and a custom capsule tray menu —
+  Segoe UI text, icon-only controls, hover pills, DPI-scaled; anti-aliased tray icon with
+  recording/paused state dots; `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
 - **Stop / pause:** one ffmpeg process records the whole session; it is never restarted. Pause/resume
    just mark wall-clock spans; on stop, `q` closes ffmpeg cleanly and `finalize` cuts the paused spans
    out of the continuous file with an exact re-encode trim (`trim`/`atrim`+`concat`), mapping the wall

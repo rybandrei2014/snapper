@@ -24,13 +24,11 @@ public class W {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
-  public static void ClickButton(string name){
+  public static void Click(int id){
     IntPtr bar = FindWindowW("SnapperCtl", null);
     if(bar==IntPtr.Zero) bar = FindWindowW("SnapperAction", null);
     if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no button bar window"); return; }
-    IntPtr btn = FindWindowExW(bar, IntPtr.Zero, "BUTTON", name);
-    if(btn==IntPtr.Zero){ Console.WriteLine("    WARN: no button '" + name + "'"); return; }
-    SendMessageW(btn, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+    SendMessageW(bar, 0x8010, (IntPtr)id, IntPtr.Zero); // WM_SNAP_CLICK: 1=Record/Pause, 2=Stop/Screenshot
   }
 }
 "@
@@ -58,7 +56,7 @@ $hwnd = [W]::FindWindowW("SnapperOverlay", $null)
 [Inj]::Up();     Start-Sleep 1
 
 "[3] chooser -> click Record"
-[W]::ClickButton("Record")
+[W]::Click(1)
 Start-Sleep 1
 
 "[4] recording 3s (jiggle mouse so ddagrab produces frames)"
@@ -67,13 +65,13 @@ Start-Sleep 1
 "[5] ctl bar: Pause, wait 2s, Resume"
 $ctl = [W]::FindWindowW("SnapperCtl", $null)
 "    ctl bar hwnd: $ctl"
-[W]::ClickButton("Pause")
+[W]::Click(1)
 Start-Sleep 2
-[W]::ClickButton("Resume")
+[W]::Click(1)
 0..6 | ForEach-Object { [Inj]::Move(600 + ($_ % 2) * 40, 500); Start-Sleep -Milliseconds 400 }
 
 "[6] ctl bar: Stop"
-[W]::ClickButton("Stop")
+[W]::Click(2)
 Start-Sleep 3
 
 Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue

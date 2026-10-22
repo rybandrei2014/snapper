@@ -271,7 +271,8 @@ pub fn start_segment(
     };
 
     let mut last_err = String::new();
-    let mut started: Option<(Child, ChildStdin, Vec<Arc<AtomicBool>>, Vec<isize>)> = None;
+    let mut started: Option<(Child, ChildStdin, Vec<Arc<AtomicBool>>, Vec<isize>, std::time::Instant)> =
+        None;
 
     for (vi, variant) in variants(p, cfg.fps).iter().enumerate() {
         for encoder in &encoders {
@@ -349,6 +350,9 @@ pub fn start_segment(
                     continue;
                 }
             };
+            // wall-clock origin = spawn instant, so pause marks align with the
+            // video timeline (first frame lags this by a small constant)
+            let t0 = std::time::Instant::now();
             let job = ffmpeg_job();
             if job != INVALID_HANDLE_VALUE {
                 unsafe {
@@ -363,9 +367,9 @@ pub fn start_segment(
 
             // short health window: bad variants (bad options, filter format
             // errors) exit within ~100 ms. Keep it short so Resume feels
-            // instant and the UI thread isn't blocked; a later crash is caught
-            // by poll_segment, which retries with libx264.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            // instant and the UI thread isn't blocked; the border + control
+            // bar are already on screen before this runs.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
             let mut alive = true;
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -376,7 +380,7 @@ pub fn start_segment(
                 }
             }
             if alive {
-                started = Some((child, stdin, audio_stops, pipe_handles));
+                started = Some((child, stdin, audio_stops, pipe_handles, t0));
                 break;
             }
 
@@ -394,7 +398,7 @@ pub fn start_segment(
         }
     }
 
-    let (child, stdin, audio_stops, audio_pipes) =
+    let (child, stdin, audio_stops, audio_pipes, t0) =
         started.ok_or_else(|| anyhow!("no working capture: {last_err}"))?;
 
     Ok(Segment {
@@ -402,7 +406,7 @@ pub fn start_segment(
         stdin: Some(stdin),
         audio_stops,
         audio_pipes,
-        start: std::time::Instant::now(),
+        start: t0,
     })
 }
 

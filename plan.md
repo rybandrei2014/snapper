@@ -1,228 +1,174 @@
-# Snapper — Windows Region Screen Recorder: Viability & Implementation Plan
+# Snapper — Visual Polish Plan (2026-10-22)
 
-## 1. Problem Statement
+> **STATUS 2026-10-22: P0–P4 implemented + bugfix round** (D2D capsules for both bars + tray
+> menu, overlay restyle + size badge + fade, glowing recording border, AA state tray icons,
+> DPI-scaled). Bugfixes: capsule buttons were capsule-relative but drawn in window coords that
+> include the shadow margin → added `m=SHADOW_PAD*sc` offset (fixes misalignment); MDL2 glyphs
+> render as tofu through the DWrite path → all bar/menu icons are now geometry (record/stop/
+> pause/play/camera/close/folder/power), tray camera glyph kept; recording perceived-start delay
+> → border + ctl bar shown before ffmpeg spawn, `Segment.start = t0` at spawn, health check
+> 400→250 ms (border appears in ~37 ms). Deviations: tray-icon 0.19 has no `show_notification`
+> → kept tooltips; acrylic blur (stretch) not done; hover tooltips on icon-only buttons not yet
+> done. Verified: `e2e_test.ps1` (6.96 s MP4), `test_shot.ps1`, `test_sync.ps1` (A/V ~33 ms),
+> `test_sync2.ps1` (pause trim: event gap 4.007 s vs expected 4 s), `visual_test.ps1` screenshots
+> of chooser/rec/pause states at 100% DPI.
+>
+> Replaces the original v1 implementation plan (all milestones through M2 done; the original
+> document is preserved in git history, commit `76593f5`). Unimplemented v1 leftovers are
+> carried over in §8.
+>
+> **Design brief (v2):** deliberately NOT Windows-native. Target aesthetic: dark, minimal,
+> "pro tool" — closer to Raycast / Linear / macOS menu-bar utilities than to Win32 chrome.
 
-The Windows Snipping Tool captures still images well but (on Windows 10 and older Windows 11 builds) lacks
-**region screen recording**: select an arbitrary rectangle on screen and record it as a video file,
-the way QuickTime does on macOS. Build a small, fast, tray-based Windows app that does exactly that.
+## 1. Problem Inventory (what looks old, and where)
 
-> Note: Microsoft started shipping screen recording in Snipping Tool for Windows 11 (2024 updates).
-> If you are on Windows 10, or want features Snipping Tool still lacks (region snapping, pause/resume,
-> bitrate control, GIF export, auto-naming, hotkey workflow), the project remains justified.
-
-## 2. Viability Analysis
-
-**Verdict: fully viable.** Every capability required is a documented, supported OS primitive:
-
-| Capability | OS / API support |
-|---|---|
-| Grab composited screen pixels of a monitor | **DXGI Desktop Duplication** (Win 8+) or **Windows.Graphics.Capture** (Win 10 1809+) — both capture the final composited frame, so any region can be cropped out |
-| Crop to user-selected rectangle | GPU copy/viewport or FFmpeg `crop` filter |
-| Include mouse cursor | WGC `IsCursorCaptureEnabled`; DXGI duplication exposes pointer data; FFmpeg `ddagrab` has `draw_cursor` |
-| H.264/HEVC encoding (HW accelerated) | **Media Foundation** (built into Windows, exposed by FFmpeg as `h264_mf`/`hevc_mf`, or NVENC/AMF/QSV) |
-| System (loopback) audio | **WASAPI loopback** capture (NAudio in .NET, or custom) |
-| Microphone audio | WASAPI capture, mix with loopback before encoding |
-| Region-selection overlay UI | Transparent, topmost, fullscreen window (WPF/Win32 layered window) — proven pattern (ShareX, Greenshot) |
-| Global hotkey | Win32 `RegisterHotKey` |
-
-Known limitations (shared by ALL capture tools, including Snipping Tool and OBS):
-
-- DRM-protected content (Widevine: Netflix, etc.) appears **black** — OS-level, unavoidable.
-- Secure desktop (UAC prompts, lock screen) cannot be captured.
-- Requires Windows 10 1809+ (realistically: Win 10 1903+ / Win 11).
-
-Precedents proving feasibility: **ShareX** (C#/WPF + FFmpeg — does exactly region video today),
-OBS Studio, Greenshot, Captura. This is a solved problem class; the work is product polish, not R&D.
-
-## 3. Technology Stack — Options Considered
-
-| Option | Stack | Pros | Cons | Verdict |
-|---|---|---|---|---|
-| A | **C++/WinRT + WGC + D3D11 + Media Foundation** | Max performance, zero deps, closest to how Microsoft builds it | Slowest development, most interop code, hardest to iterate | Overkill for v1 |
-| B | **C# / .NET 8 + WPF + FFmpeg sidecar + NAudio** | Fast UI dev; FFmpeg's `ddagrab` (DXGI duplication) does capture+crop+encode in one proven process; NAudio handles WASAPI loopback; ShareX precedent | Ships ffmpeg.exe (~10–20 MB); ~100 MB self-contained binary | Runner-up |
-| C | Rust + `windows-rs` (Win32/WGC) + FFmpeg sidecar | ~0.6 MB native binary, no runtime, memory safety; `windows-rs` gives first-class Win32 bindings | Overlay UI hand-rolled in Win32 (done); slower UI iteration | ✅ **Chosen** |
-| D | Electron/Tauri + native capture plugin | Fancy web UI | Heavy, no UI advantage for an overlay tool | No |
-| E | Python + mss + OpenCV + FFmpeg | Prototype in hours | GIL + GDI capture = CPU-bound, no polished UX | Spike/throwaway only |
-
-### Chosen stack (Option C — Rust, decided 2026-10-22)
-
-- **Language/runtime:** Rust (stable MSVC), `windows` crate 0.58 for Win32, `tray-icon`/`muda` for tray,
-  `anyhow`/`serde`/`chrono`. Release binary ~0.6 MB, self-contained, x64 + ARM64-capable.
-- **UI:** raw Win32 layered windows (per-pixel alpha via `UpdateLayeredWindow`) for the dimmed
-  selection overlay and the click-through recording border; hidden message window + `RegisterHotKey`.
-- **Capture + video encode:** bundled **FFmpeg** sidecar: `ddagrab` (DXGI Desktop Duplication) with
-  `offset_x/offset_y/video_size` region options + `hwdownload,format=bgra` → `h264_mf` (HW encoder),
-  with an automatic fallback chain for older ffmpeg versions and encoders.
-- **Audio (M2):** WASAPI loopback + mic via `windows` crate → raw PCM file per segment → `amix` + AAC
-  muxed at finalize (named-pipe input stalled ffmpeg on this build; file-based muxing is simpler/robust).
-- **Packaging:** Inno Setup or WiX installer; code signing; optional MS Store.
-
-Why the FFmpeg sidecar instead of hand-rolled WGC+MF? It removes the two riskiest chunks of the project
-(frame acquisition and encoder interop) on day one, at the cost of one bundled executable. CPU cost of
-`ddagrab + hwdownload + h264_mf` for a 1080p60 region is a few percent on modern hardware. If profiling
-ever shows a bottleneck, the capture path can be swapped to native WGC (`windows-rs` supports it) without
-touching the rest of the app — see §7 v2.
-
-## 4. Architecture
-
-```
-┌────────────────────────────────────────────────────────────┐
-│ snapper.exe (Rust, ~0.6 MB, tray-resident)                 │
-│                                                            │
-│  RegisterHotKey(Win+Shift+R) ──► state machine (main.rs)   │
-│  (hidden message window)         │                         │
-│                                  ├─► overlay.rs            │
-│                                  │    dimmed fullscreen    │
-│                                  │    layered window,      │
-│                                  │    drag-select rect,    │
-│                                  │    red recording border │
-│                                  │    (click-through)      │
-│                                  ├─► capture.rs            │
-│                                  │    ffmpeg sidecar:      │
-│                                  │    ddagrab → hwdownload │
-│                                  │    → h264_mf, stop via  │
-│                                  │    'q' on stdin         │
-│                                  ├─► audio.rs              │
-│                                  │    WASAPI loopback+mic  │
-│                                  │    → raw PCM files →    │
-│                                  │    amix+mux at finalize │
-│                                  └─► output naming         │
-│                                       Videos\Snapper\*.mp4 │
-│  tray-icon ◄── start / stop / open folder / quit           │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Capture pipeline (implemented)
-
-```
-ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:offset_y=Y:video_size=WxH" \
-       -vf "hwdownload,format=bgra" \
-       -c:v h264_mf -b:v 12000K -pix_fmt nv12 -an -f mp4 -y out.mp4
-```
-
-- `offset_x/offset_y/video_size` crop **during capture** (monitor-relative coords) — cheaper than a
-  crop filter; `hwdownload` is required because recent ffmpeg builds output D3D11 hardware frames.
-- A variant chain retries with `-vf crop=` and `libx264` automatically on older ffmpeg builds.
-- **Pause/resume (M2, implemented):** record numbered segments (`name.seg000.mp4`…), stop each with `q`,
-  join video with the `concat` demuxer (`-c copy`) and audio by concatenating raw PCM, then mux once.
-  ffmpeg children live in a Win32 job object (`KILL_ON_JOB_CLOSE`) so orphans can't hold the DXGI session.
-- **Stop:** send `q` to ffmpeg stdin → clean moov atom, valid MP4.
-- **Health check caveat:** never gate startup on output file size — static screens encode at ~0.1 kbps
-  and the mp4 muxer may not flush 1 KB for several seconds; only early process exit marks a variant dead.
-
-### State machine
-
-`Idle → Selecting → Choosing(Record/Screenshot) → Recording ⇄ Paused → Finalizing → Idle`
-
-## 5. Milestones & Tasks
-
-### M0 — Feasibility spike ✅ DONE (2026-10-22)
-- `ddagrab` verified on this machine: needs `hwdownload,format=bgra` (D3D11 frames) and
-  `draw_mouse` (not `draw_cursor`) on the installed ffmpeg (gyan 2024-04 build).
-- 1080p-class region → clean MP4 via `h264_mf`, CPU negligible.
-
-### M1 — MVP ✅ DONE (2026-10-22, Rust)
-- [x] Cargo project: `main.rs` (state machine, tray, hotkey), `overlay.rs`, `capture.rs`, `util.rs`, `config.rs`
-- [x] Global hotkey `Win+Shift+R` → fullscreen dimmed layered-window overlay, drag-to-select, Esc/RMB cancel
-- [x] ffmpeg spawn with region options; red click-through border while recording; stop via same hotkey
-- [x] MP4 in `Videos\Snapper\yyyy-MM-dd_HH-mm-ss.mp4`; tray menu (start/stop/open folder/quit); single instance
-- [x] `e2e_test.ps1`: injects hotkey + mouse drag, verifies output with ffprobe — **passing**
-- Not yet: live size label during drag, resize handles, floating control bar (tray/hotkey stop instead)
-
-### M2 — Audio & recording features (core done 2026-10-22)
-- [x] System (loopback) audio: WASAPI → raw PCM **named pipe into the same ffmpeg** → AAC, so ffmpeg
-      timestamps A/V on one clock (48 kHz stereo, mix format auto-detected; `audio: false` switch;
-      silence padding keeps the stream continuous while the system is quiet) ✅ verified: 440 Hz tone
-      → mean −23 dB in output
-- [x] Mic input mixed with loopback (second WASAPI capture → second pipe → `amix` inside ffmpeg;
-      `mic: true` switch; degrades gracefully when no mic present) ✅ amix graph verified; real-mic
-      path untested (dev machine has no capture device)
-- [x] **A/V sync fix:** audio shares ffmpeg's clock (was: separate raw-file capture started ~1.2 s
-      after video → sound led picture). Audio threads open their pipe and stream as ffmpeg opens it.
-      No `-shortest`, no first-frame gate (both truncated/skewed recordings on static screens).
-      Residual is a ~0.4 s constant audio-init lag (WASAPI starts slightly after the first video
-      frame); near perceptual threshold, smaller on an active screen.
-- [x] Pause/resume = **single continuous recording + trim** (rewritten 2026-10-22): ffmpeg is never
-      restarted. Pause/resume mark wall-clock spans; at stop, `finalize` maps them onto the file
-      timeline (calibrating startup latency via ffprobe duration) and cuts them out with an exact
-      re-encode trim (`trim`/`atrim`+`concat`). Removes the per-segment cold start that caused the
-      ~1 s "stuck first frame" + audio dropout at every resume. `Win+Alt+P` (fallback `Ctrl+Alt+P`;
-      `Win+Shift+P` is the Windows display-switch hotkey — do not use), tray + control-bar buttons ✅
-      verified: 3 s + pause 2 s + 3 s → single ~6.9 s MP4, no gaps across the cut (`e2e_test.ps1`)
-- [x] Region screenshot (Snipping-Tool style): same drag-select, then a Record/Screenshot chooser;
-      screenshot = `ddagrab -frames:v 1` → PNG in `screenshot_dir` (defaults to `output_dir`) ✅
-      verified: 801×501 region → 801×501 PNG (`test_shot.ps1`)
-- [x] Floating control bar during recording (Pause/Resume · Stop) anchored just outside the
-      region, in addition to the hotkey and tray menu ✅ verified via `e2e_test.ps1` button clicks
-- [ ] Per-source volume knobs in settings
-- [ ] Countdown timer, re-select-last-region (`Win+Shift+G`)
-- [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV
-- [ ] Per-monitor DPI correctness across mixed-DPI multi-monitor setups
-- **Acceptance:** A/V in sync after 10-min recording; pause/resume produces one valid file. ✅ latter done
-
-### M3 — v1.0 release polish (2–3 weeks)
-- [ ] Settings window (hotkeys, output folder, quality, audio devices, run-on-startup).
-- [ ] Crash handling + ffmpeg stderr logging; "recording interrupted" recovery of segments.
-- [ ] Installer (Inno Setup), **code signing**, auto-update check.
-- [ ] Performance pass: idle RAM < 100 MB, recording CPU budget met.
-- **Acceptance:** install on a clean Win 10/11 VM, no SmartScreen scare, 8-hour soak stable.
-
-### M4 — v1.x differentiators (ongoing)
-- [ ] GIF export (region → GIF/APNG), trim-after-record quick edit.
-- [ ] Window snapping during selection (edge snap to window bounds via `EnumWindows` geometry).
-- [ ] Click highlighting / keystroke overlay for tutorials.
-- [ ] Native WGC capture pipeline (see §7) if ffmpeg path shows CPU/latency limits.
-- [ ] Clipboard copy of recording, simple upload (0x0.st/S3) with explicit user opt-in.
-
-**Total effort (solo):** MVP in ~2 weeks, v1.0 in ~6–8 weeks part-time.
-
-## 6. Risks & Mitigations
-
-| Risk | Impact | Mitigation |
+| Element | Current implementation | Why it looks like a legacy app |
 |---|---|---|
-| `ddagrab` needs FFmpeg ≥ 6.1 (cursor options ≥ 7.0) | Build breakage | Bundle pinned FFmpeg 7.x build with the app |
-| Mixed-DPI multi-monitor coordinate math | Wrong crop region | Use virtual-screen coords + `PerMonitorV2` DPI awareness; test matrix |
-| A/V drift on long recordings | Out-of-sync audio | `-fflags +genpts`, wallclock timestamps; concat segments ≤ 10 min |
-| Audio device change mid-recording | Lost audio | Restart loopback capture on device callback, keep timestamps |
-| DRM content records black | User confusion | Document; show one-time notice |
-| SmartScreen blocks unsigned exe | Adoption friction | OV code-signing cert (~$100–400/yr) before public release |
-| WPF overlay quirks (topmost fights, click-through) | UX bugs | Proven pattern: `Topmost` + `ShowInTaskbar=false` + WS_EX_TOOLWINDOW; ShareX precedent |
-| 4K fullscreen recording CPU | Jank | Region crop before encode; default 60 fps cap; HW encoder default |
+| Record/Screenshot bar | Plain `WS_POPUP` with `COLOR_BTNFACE` background (`overlay.rs:109`) + classic `BUTTON` child controls (`overlay.rs:448-470`) | System gray face, no rounding, no shadow, no dark theme, fixed 224×44 px |
+| Pause/Stop control bar | Same pattern (`overlay.rs:117-124`, `overlay.rs:514-578`) | Same; fixed 168×36 px |
+| Fonts | `GetStockObject(DEFAULT_GUI_FONT)` (`overlay.rs:447`, `overlay.rs:548`) | **Biggest tell.** Bitmap "MS Sans Serif" — aliased, tiny, never scales with DPI |
+| Selection overlay | Fullscreen dim alpha 128 (`overlay.rs:26`), 2 px hard red border drawn *inside* the selection (`overlay.rs:234-243`) | Too dark, harsh square border, no size readout, no guides, no fade-in |
+| Recording border | 3 px hard red rectangle (`overlay.rs:376-381`) | Square, no outline/contrast strategy, no animation |
+| Tray icon | Procedural 32×32 red circle, `sqrt(dx²+dy²) <= 13.5` (`main.rs:82-99`) | Hard-edged (no anti-aliasing) → jaggy at every DPI; same icon in every state |
+| Tray context menu | Plain text `muda` items (`main.rs:169-185`) | Native HMENU: classic gray on Win10, plain/iconless on Win11 |
+| Motion | None anywhere | Modern UIs fade/slide in; everything here pops instantly |
+| DPI | Process is PerMonitorV2 (`main.rs:103`) but bars use hardcoded physical pixel sizes | On 150%/200% displays bars are tiny and text is unreadable |
 
-## 7. v2 Native Pipeline (only if needed)
+Root causes, ranked by perceived impact:
+1. **Bitmap stock font** — instantly reads as Windows 95/XP.
+2. **System-color chrome** (COLOR_BTNFACE gray) instead of a designed surface.
+3. **No depth**: no rounding, no shadow, no hairline strokes.
+4. **Jagged, stateless tray icon**.
+5. **No DPI scaling, no motion, no translucency.**
 
-Replace ffmpeg's capture with **Windows.Graphics.Capture**:
-`Direct3D11CaptureFramePool` on the monitor → GPU `CopySubresourceRegion` of the crop rect →
-staging texture → `Map` → rawvideo pipe into ffmpeg (encoder unchanged), or full zero-copy
-Media Foundation `IMFTransform` H.264 encoder fed by the D3D11 texture.
-Benefits: lower CPU, guaranteed cursor rendering, HDR path, window-scoped capture (capture a single
-window even when occluded). Cost: significant interop code (C# via Vortice/ComWrappers or C++).
-Decision gate: only if M3 profiling shows the ffmpeg path inadequate.
+## 2. Design Direction — "dark minimal capsule"
 
-## 8. Repository Layout
+Think: a floating macOS menu-bar utility. Small translucent capsules, hairline strokes,
+icon-only controls, one accent color, quiet motion. No system colors, no native widgets.
+
+Design tokens (new `src/theme.rs`, all values in **logical px (DIPs)**, × monitor scale):
 
 ```
-snapper/
-  src/
-    main.rs       # state machine, tray menu, hotkey, single instance, message loop
-    overlay.rs    # selection overlay + recording border (layered windows)
-    capture.rs    # ffmpeg sidecar: variant fallback chain, stdin stop, segment polling, finalize mux
-    util.rs       # monitors (EnumDisplayMonitors), rect math, ffmpeg lookup
-    config.rs     # %APPDATA%\Snapper\config.json
-  e2e_test.ps1    # injected-input end-to-end test (hotkey + drag + record + ffprobe check)
-  test_shot.ps1   # injected-input screenshot test (hotkey + drag + chooser + ffprobe check)
-  test_sync.ps1   # A/V sync test (flash+beep clip, measures audio-vs-video offset)
-  plan.md  design.md  README.md
-  target/release/snapper.exe   # ~0.6 MB; ship ffmpeg.exe beside it
+capsule:      radius = height/2 (full pill); bars 36 DIP tall
+surface:      #0E0E11 @ 78% alpha (near-black, cool)
+hairline:     #FFFFFF @ 10%, 1px inner stroke (the "glass edge")
+shadow:       black 40% @ 24px blur falloff (drawn procedurally)
+accent:       #c4413a (soft red, macOS-ish) — used ONLY for: record dot, recording border
+text:         #FFFFFFE6; secondary #FFFFFF99
+hover:        #FFFFFF @ 10% pill behind icon; pressed @ 16%
+font:         Segoe UI Variable Text → fallback Segoe UI; 13px; NO bold except live timer
+icons:        Segoe MDL2 / Segoe Fluent glyphs, 16px, stroke-only look:
+              record ●, camera, pause, stop, play, folder, power (verify codepoints at impl)
+spacing:      icon buttons 32×32 DIP, 4px gaps, 8px capsule padding; NO text labels on bars
+selection:    dim #000000 @ 33%; selection edge = 1px #FFFFFF @ 85% drawn OUTSIDE the region
+size badge:   small capsule, 12px text "1280 × 720", follows cursor, 6px offset
+motion:       150ms fade + 4px slide-up (ease-out) for bars; 160ms fade for overlay;
+              recording border: static (no pulse) — minimalism; timer text is the only "alive" thing
 ```
 
-Licensing: app MIT/proprietary (your choice); ship LGPL-licensed FFmpeg build (no GPL filters in MVP);
-`windows`, `tray-icon`, `muda`, `anyhow`, `serde`, `chrono` all MIT/Apache-2.0.
+Icon-only buttons hurt discoverability → compensate with hover tooltips (custom-drawn mini
+capsule) and keyboard accelerators (Enter/Space/Esc).
 
-## 9. MVP Acceptance Criteria (definition of done)
+## 3. Rendering Options
 
-1. `Win+Shift+R` anywhere → drag a region → recording starts within 500 ms.
-2. 1080p60 region recorded 10 min: file plays in Edge/VLC/PotPlayer, A/V in sync, CPU < 10% (HW encode).
-3. Cursor visible in capture; system audio captured; Esc/⏹ stop produces valid MP4 every time.
-4. Works on Windows 10 1903+ and Windows 11, single and mixed-DPI dual monitors.
-5. Idle footprint: tray only, < 100 MB RAM, no visible window.
+| Option | Approach | Pros | Cons | Verdict |
+|---|---|---|---|---|
+| A | GDI DIB + `UpdateLayeredWindow` (current pipeline, `overlay.rs:154-179`) | Already proven in-repo, zero deps | Hand-rolled AA for rounded pills/gradients is painful; GDI text is not premultiplied, mediocre at fractional DPI | Only for the fullscreen dim fill |
+| B | **Direct2D + DirectWrite → WIC bitmap → `UpdateLayeredWindow`** | OS-provided (no crates beyond `windows` features), perfect AA geometry (rounded rects, strokes, radial-gradient glow), crisp text at any DPI, premultiplied by default — exactly what "slick" requires | ~1 day interop setup (`ID2D1Factory`, `ID2D1HwndRenderTarget` or WIC→DIB) | ✅ **Chosen** for bars, badges, menus, tray icons |
+| C | egui/Slint | Fast to style | +1.5–3 MB, transparency quirks, two UI stacks | Only for the future settings window (P5) |
+| D | XAML/WinUI | Native modern | Runtime dep, Windows-look ceiling — opposite of the brief | No |
+
+**Real backdrop blur (the "acrylic" differentiator):** on Win11, non-layered windows can get
+`DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE = DWMSBT_TRANSIENT_WINDOW)` → true acrylic;
+Win10 fallback: `DwmEnableBlurBehindWindow` (frosted) → flat translucent if that fails.
+Layered windows can't have backdrops, so bars in blur mode use a normal `WS_POPUP` + D2D
+`IDCompositionTarget`. Treat as **P1 stretch goal** — flat 78% capsule already looks modern;
+blur is polish on top. Decision: ship flat first, try blur behind a config flag.
+
+## 4. Work Plan
+
+### P0 — Quick wins (≈ half a day)
+1. Fonts: `theme.rs::ui_font(dpi)` → `CreateFontW("Segoe UI Variable Text" → "Segoe UI")`;
+   replace both `DEFAULT_GUI_FONT` uses (`overlay.rs:447`, `overlay.rs:548`).
+2. Bar background: dark brush instead of `COLOR_BTNFACE`; `WM_CTLCOLORBTN`/`WM_ERASEBKGND`
+   so buttons don't repaint gray (interim until P1 deletes the BUTTON children).
+3. Tray icon: supersample (render 128², coverage AA, box-downsample to `SM_CXSMICON × DPI`).
+4. Menu: `muda::MenuItem::set_icon` glyphs + shorter labels (interim until P4).
+5. `tray.show_notification("Saved …")` for terminal events (`main.rs:431-447`, `main.rs:493-507`).
+
+### P1 — Capsule bars, custom-drawn (≈ 2 days, the big one)
+New `src/ui.rs`: D2D/DWrite render helpers (capsule, hairline, icon glyph, text, glow) +
+one `FloatingCapsule` window type replacing both `SnapperAction` and `SnapperCtl`:
+- `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW`; render into WIC premultiplied BGRA →
+  `UpdateLayeredWindow` (same present path as overlay).
+- **Action bar**: capsule, icon-only: ⏺ record, 📷 screenshot, ✕ cancel (cancel = explicit affordance
+  we currently lack outside Esc).
+- **Control bar**: ⏸/▶ toggle, ⏹ stop, plus a live `mm:ss` timer in text token — the one dynamic
+  element; timer also communicates paused state (dimmed + "⏸" glyph) better than a label swap.
+- Hover/press pills via `WM_MOUSEMOVE` + `TrackMouseEvent` (leave → repaint); hit rects in state;
+  click posts existing `WM_APP_ACTION`/`WM_APP_CTL` ids — state machine untouched.
+- Keyboard: Enter = primary, Space = pause toggle, Esc unchanged; no focus rectangles — default
+  button gets a 1px accent hairline instead.
+- DPI: DIP tokens × `GetDpiForWindow`; `WM_DPICHANGED` re-renders.
+- Stretch: acrylic backdrop mode (see §3).
+
+### P2 — Overlay & recording border (≈ 1 day)
+1. Dim 128 → ~85 alpha; selection border: 1 px white @ 85% drawn *outside* the region
+   (`paint_overlay`, `overlay.rs:234-248`).
+2. Live size badge (capsule, follows cursor) — closes the M1 gap.
+3. Fade-in via `SetTimer` + `LWA_ALPHA` ramp (overlay); bars fade+slide in P1.
+4. Recording border: 1.5 px accent + 2 px soft outer glow (alpha falloff in the DIB) instead of
+   3 px hard red; no pulse.
+5. Optional (ties to M4): window-edge snapping, 8 px magnet, hairline highlight on snap edges.
+
+### P3 — Tray identity (≈ half a day)
+- Thin-stroke aperture/camera glyph, **monochrome** (white + 15% dark halo → works on light and
+  dark taskbars); states: idle glyph only · recording = glyph + accent dot · paused = glyph +
+  amber dot. AA, sizes 16–48.
+- `tray.set_icon()` on every `Mode` transition (`main.rs`).
+
+### P4 — Custom tray menu (≈ 1–2 days, now default not optional)
+Native HMENU contradicts the design brief (gray Win10 / plain Win11). Reuse P1's capsule renderer:
+dark capsule popup at cursor, generous padding, pill hover, icon + label rows, separator hairline,
+Esc/arrows/click-out dismiss. Keep `muda`'s `MenuEvent` ids as the action contract so `main.rs`
+is untouched. (Native dark-menu hacks via uxtheme ordinals: forbidden — undocumented.)
+
+### P5 — Settings window (deferred, pairs with v1-plan M3)
+The one place where **Option C (egui or Slint)** earns its keep — real form controls, same tokens.
+Capsules/overlay stay D2D.
+
+## 5. Verification
+
+- `e2e_test.ps1` / `test_shot.ps1` click **fixed button coordinates** — capsule geometry changes
+  break them; update coordinates in the same commit (or read bar position from debug output).
+- Manual matrix: 100/150/200% DPI, light + dark taskbar, Win10 + Win11; screenshot every surface.
+- D2D check: text crisp at 125/150%; capsule edges smooth (zoom 400%); no GDI text fallback left.
+- Acceptance: bars read as one designed system (same capsule/hairline/hover); Record/Screenshot
+  and Pause/Stop e2e flows still pass; idle CPU unchanged (bars render only on state/hover change).
+
+## 6. Risks
+
+| Risk | Mitigation |
+|---|---|
+| D2D/windows-rs interop boilerplate | One-time `ui.rs` helper; fallback to GDI DIB (Option A) if it stalls — visual ceiling lower but plan survives |
+| e2e scripts break on new geometry | Update coordinates same commit; keep hit rects stable |
+| Icon-only buttons = poor discoverability | Hover tooltips (mini capsule) + accelerators + tray menu keeps text labels |
+| WIC→`UpdateLayeredWindow` premultiplication mistakes | D2D/WIC are premultiplied natively; test with 50% surface over bright desktop first |
+| Acrylic is Win11-only; blur-behind quirks on Win10 | Flat translucent default; blur behind config flag, per-OS fallback chain |
+| Custom menu = keyboard nav/Dismiss/monitor-clamping all ours | Small item count (≤6); clamp to work area; Esc + click-outside; arrows optional v1.1 |
+| Segoe Fluent Icons absent on Win10 | Fall back to Segoe MDL2 Assets (same glyphs) |
+
+## 7. Suggested Commit Order
+
+1. `theme.rs` + fonts + dark brush + AA tray icon + menu icons + notifications (P0)
+2. `ui.rs` D2D capsule renderer + action bar (P1a) → control bar + timer (P1b) + e2e updates
+3. Overlay dim/hairline/badge/fade + recording border glow (P2)
+4. Tray state glyphs + `set_icon` wiring (P3)
+5. Custom capsule tray menu (P4)
+6. (stretch, flag-gated) acrylic backdrop mode
+
+## 8. Carried over from v1 plan (still open)
+
+Countdown timer · re-select last region (`Win+Shift+G`) · quality presets · settings window (P5) ·
+installer + code signing · GIF export · window snapping (P2.5) · per-monitor DPI correctness
+(P1 makes UI DPI-correct; capture-side DPI math still open).

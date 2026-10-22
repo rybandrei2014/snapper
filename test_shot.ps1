@@ -19,12 +19,10 @@ public class W {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
-  public static void ClickButton(string name){
+  public static void Click(int id){
     IntPtr bar = FindWindowW("SnapperAction", null);
     if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no action bar window"); return; }
-    IntPtr btn = FindWindowExW(bar, IntPtr.Zero, "BUTTON", name);
-    if(btn==IntPtr.Zero){ Console.WriteLine("    WARN: no button '" + name + "'"); return; }
-    SendMessageW(btn, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+    SendMessageW(bar, 0x8010, (IntPtr)id, IntPtr.Zero); // WM_SNAP_CLICK: 2=Screenshot
   }
 }
 "@
@@ -50,7 +48,7 @@ Start-Sleep 2
 [Inj]::Up();     Start-Sleep 1
 
 "[3] chooser -> click Screenshot"
-[W]::ClickButton("Screenshot")
+[W]::Click(2)
 Start-Sleep 2
 
 Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
