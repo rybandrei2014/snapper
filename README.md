@@ -6,19 +6,22 @@ get an MP4 — the QuickTime-style region recording that Windows 10 Snipping Too
 ## Status
 
 MVP working end-to-end: hotkey → dimmed fullscreen overlay → drag-select →
-`ffmpeg ddagrab` capture of the region + **system audio (WASAPI loopback)** → H.264/AAC MP4 →
-red border while recording, stop with the same hotkey. Verified by `e2e_test.ps1` (injects real
+`ffmpeg ddagrab` capture of the region + **system audio (WASAPI loopback)** (+ optional mic mix) →
+H.264/AAC MP4 → red border while recording, stop with the same hotkey, **pause/resume** with
+`Win+Alt+P` (segments joined automatically). Verified by `e2e_test.ps1` (injects real
 hotkey + mouse drag, checks output with ffprobe).
 
-Not yet implemented (see plan.md): microphone input, pause/resume, countdown, settings UI, installer.
+Not yet implemented (see plan.md): countdown, settings UI, installer.
 
 ## Usage
 
 1. Make sure `ffmpeg.exe` (6.1+, 7.x recommended) is next to `snapper.exe` or on PATH.
 2. Run `snapper.exe` — it lives in the system tray.
 3. `Win+Shift+R` → screen dims → drag a region → recording starts (red border around region).
-4. `Win+Shift+R` again (or tray → Stop) to finish. `Esc` / right-click cancels selection.
-5. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4`.
+4. `Win+Alt+P` pauses/resumes (falls back to `Ctrl+Alt+P` if taken; `Win+Shift+P` is the Windows
+   display-switch hotkey and is deliberately not used).
+5. `Win+Shift+R` again (or tray → Stop) to finish. `Esc` / right-click cancels selection.
+6. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4`.
 
 ## Configuration
 
@@ -55,12 +58,16 @@ powershell -ExecutionPolicy Bypass -File e2e_test.ps1
   to system memory. A fallback chain (region options → crop filter; `h264_mf` → `libx264`) adapts
   to older ffmpeg builds automatically.
 - **Audio:** WASAPI capture (`IAudioClient`) on the default render endpoint with
-  `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic),
-  each streamed as raw PCM/float over its own named pipe into ffmpeg; with mic enabled the two
-  streams are mixed via `amix`. If a source fails, recording degrades (mic-only failure → system
+  `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic).
+  Each source is written to a raw PCM file during recording (silence is synthesized while the
+  system is quiet); at finalize the files are concatenated, mixed via `amix` when a mic track
+  exists, and muxed to AAC. If a source fails, recording degrades (mic-only failure → system
   audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
   selection overlay and the click-through recording border; `tray-icon` for the tray;
   `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
-- **Stop:** `q` is written to ffmpeg's stdin, producing a clean, valid MP4; completion is
-  signalled back to the UI thread via a posted `WM_APP` message.
+- **Stop / pause:** `q` is written to ffmpeg's stdin, producing a clean, valid MP4; completion is
+  detected by polling the child process from the message loop. Pause simply ends the current
+  segment; resume starts a new one; on stop, segments are joined with the `concat` demuxer
+  (`-c copy`) plus the audio mux, so the result is one continuous file. ffmpeg children are
+  assigned to a Win32 job object so they can never outlive the app.

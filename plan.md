@@ -53,7 +53,8 @@ OBS Studio, Greenshot, Captura. This is a solved problem class; the work is prod
 - **Capture + video encode:** bundled **FFmpeg** sidecar: `ddagrab` (DXGI Desktop Duplication) with
   `offset_x/offset_y/video_size` region options + `hwdownload,format=bgra` → `h264_mf` (HW encoder),
   with an automatic fallback chain for older ffmpeg versions and encoders.
-- **Audio (M2, pending):** WASAPI loopback via `windows` crate (or `cpal`), PCM piped to ffmpeg → AAC.
+- **Audio (M2):** WASAPI loopback + mic via `windows` crate → raw PCM file per segment → `amix` + AAC
+  muxed at finalize (named-pipe input stalled ffmpeg on this build; file-based muxing is simpler/robust).
 - **Packaging:** Inno Setup or WiX installer; code signing; optional MS Store.
 
 Why the FFmpeg sidecar instead of hand-rolled WGC+MF? It removes the two riskiest chunks of the project
@@ -81,9 +82,10 @@ touching the rest of the app — see §7 v2.
 │                                  │    ddagrab → hwdownload │
 │                                  │    → h264_mf, stop via  │
 │                                  │    'q' on stdin         │
-│                                  ├─► audio.rs (M2)         │
+│                                  ├─► audio.rs              │
 │                                  │    WASAPI loopback+mic  │
-│                                  │    → PCM pipe → AAC     │
+│                                  │    → raw PCM files →    │
+│                                  │    amix+mux at finalize │
 │                                  └─► output naming         │
 │                                       Videos\Snapper\*.mp4 │
 │  tray-icon ◄── start / stop / open folder / quit           │
@@ -101,8 +103,12 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - `offset_x/offset_y/video_size` crop **during capture** (monitor-relative coords) — cheaper than a
   crop filter; `hwdownload` is required because recent ffmpeg builds output D3D11 hardware frames.
 - A variant chain retries with `-vf crop=` and `libx264` automatically on older ffmpeg builds.
-- **Pause/resume (M2):** record numbered segments, `concat` demuxer on stop (keyframe-aligned, instant).
+- **Pause/resume (M2, implemented):** record numbered segments (`name.seg000.mp4`…), stop each with `q`,
+  join video with the `concat` demuxer (`-c copy`) and audio by concatenating raw PCM, then mux once.
+  ffmpeg children live in a Win32 job object (`KILL_ON_JOB_CLOSE`) so orphans can't hold the DXGI session.
 - **Stop:** send `q` to ffmpeg stdin → clean moov atom, valid MP4.
+- **Health check caveat:** never gate startup on output file size — static screens encode at ~0.1 kbps
+  and the mp4 muxer may not flush 1 KB for several seconds; only early process exit marks a variant dead.
 
 ### State machine
 
@@ -123,18 +129,21 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - [x] `e2e_test.ps1`: injects hotkey + mouse drag, verifies output with ffprobe — **passing**
 - Not yet: live size label during drag, resize handles, floating control bar (tray/hotkey stop instead)
 
-### M2 — Audio & recording features (in progress)
-- [x] WASAPI loopback capture → named pipe → ffmpeg → AAC (48 kHz stereo, mix format auto-detected;
-      `audio: false` config switch; auto-retry chain without audio if it fails) ✅ 2026-10-22
-- [x] Mic input mixed with loopback (second WASAPI capture → second pipe → `amix`; `mic: true`
-      switch; degrades gracefully when no mic present) ✅ 2026-10-22 — amix graph verified with
-      synthetic sources; real-mic path untested (dev machine has no capture device)
+### M2 — Audio & recording features (core done 2026-10-22)
+- [x] System (loopback) audio: WASAPI → raw PCM file per segment → AAC muxed at finalize
+      (48 kHz stereo, mix format auto-detected; `audio: false` switch; silence padding keeps the
+      stream continuous while the system is quiet) ✅ verified: 440 Hz tone → mean −23 dB in output
+- [x] Mic input mixed with loopback (second WASAPI capture → second raw file → `amix` at finalize;
+      `mic: true` switch; degrades gracefully when no mic present) ✅ amix graph verified; real-mic
+      path untested (dev machine has no capture device)
+- [x] Pause/resume with segment concat: `Win+Alt+P` (fallback `Ctrl+Alt+P`; `Win+Shift+P` is the
+      Windows display-switch hotkey — do not use), tray Pause/Resume/Stop with enable states ✅
+      verified: 3 s + pause 2 s + 1.5 s → single 4.5 s MP4 with audio, twice in a row
 - [ ] Per-source volume knobs in settings
-- [ ] Pause/resume with segment concat
 - [ ] Countdown timer, re-select-last-region (`Win+Shift+G`)
 - [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV
 - [ ] Per-monitor DPI correctness across mixed-DPI multi-monitor setups
-- **Acceptance:** A/V in sync after 10-min recording; pause/resume produces one valid file.
+- **Acceptance:** A/V in sync after 10-min recording; pause/resume produces one valid file. ✅ latter done
 
 ### M3 — v1.0 release polish (2–3 weeks)
 - [ ] Settings window (hotkeys, output folder, quality, audio devices, run-on-startup).
@@ -182,7 +191,7 @@ snapper/
   src/
     main.rs       # state machine, tray menu, hotkey, single instance, message loop
     overlay.rs    # selection overlay + recording border (layered windows)
-    capture.rs    # ffmpeg sidecar: variant fallback chain, stdin stop, watcher thread
+    capture.rs    # ffmpeg sidecar: variant fallback chain, stdin stop, segment polling, finalize mux
     util.rs       # monitors (EnumDisplayMonitors), rect math, ffmpeg lookup
     config.rs     # %APPDATA%\Snapper\config.json
   e2e_test.ps1    # injected-input end-to-end test (hotkey + drag + ffprobe check)

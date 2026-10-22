@@ -7,6 +7,7 @@ public class Inj {
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int idx);
   public static void Key(byte vk, bool down){ keybd_event(vk,0,(uint)(down?0:2),UIntPtr.Zero); }
   public static void Hotkey(){ Key(0x5B,true); Key(0x10,true); Key(0x52,true); Key(0x52,false); Key(0x10,false); Key(0x5B,false); }
+  public static void HotkeyP(){ Key(0x5B,true); Key(0x12,true); Key(0x50,true); Key(0x50,false); Key(0x12,false); Key(0x5B,false); }
   public static void Move(int x,int y){
     int vw=GetSystemMetrics(78), vh=GetSystemMetrics(79), vx=GetSystemMetrics(76), vy=GetSystemMetrics(77);
     uint ax=(uint)(((long)(x-vx)*65535)/(vw-1)); uint ay=(uint)(((long)(y-vy)*65535)/(vh-1));
@@ -22,6 +23,7 @@ $before = @(Get-ChildItem $outDir -Filter *.mp4 -ErrorAction SilentlyContinue)
 
 $err = Join-Path $env:TEMP "snapper_err.txt"
 $o = Join-Path $env:TEMP "snapper_out.txt"
+Get-Process ffmpeg,snapper -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 $app = Start-Process -FilePath "target\debug\snapper.exe" -PassThru -WindowStyle Hidden -RedirectStandardError $err -RedirectStandardOutput $o
 Start-Sleep 3
 
@@ -42,14 +44,21 @@ $hwnd = [W]::FindWindowW("SnapperOverlay", $null)
 [Inj]::Move(1200,800); Start-Sleep -Milliseconds 300
 [Inj]::Up();     Start-Sleep 1
 
-"[3] recording 5s"
-Start-Sleep 5
+"[3] recording 3s"
+Start-Sleep 3
 
-"[4] hotkey -> stop"
+"[4] pause (Win+Shift+P), wait 2s, resume"
+[Inj]::HotkeyP()
+Start-Sleep 2
+[Inj]::HotkeyP()
+Start-Sleep 3
+
+"[5] hotkey -> stop"
 [Inj]::Hotkey()
 Start-Sleep 3
 
 Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+Get-Process ffmpeg -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $after = @(Get-ChildItem $outDir -Filter *.mp4 -ErrorAction SilentlyContinue)
 $new = $after | Where-Object { $before.Name -notcontains $_.Name }

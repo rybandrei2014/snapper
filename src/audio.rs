@@ -1,21 +1,19 @@
 use anyhow::{anyhow, Result};
 use std::ffi::c_void;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, eCapture, eConsole, eRender,
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
-use windows::Win32::Storage::FileSystem::PIPE_ACCESS_OUTBOUND;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW};
-use windows::Win32::Storage::FileSystem::WriteFile;
 
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 2;
 const WAVE_FORMAT_PCM: u16 = 1;
@@ -40,9 +38,9 @@ fn device_for(source: Source) -> Result<IMMDevice> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let (flow, _label) = match source {
-            Source::Loopback => (eRender, "render"),
-            Source::Mic => (eCapture, "capture"),
+        let flow = match source {
+            Source::Loopback => eRender,
+            Source::Mic => eCapture,
         };
         let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
         Ok(device)
@@ -57,7 +55,7 @@ fn parse_wf(wf: *const WAVEFORMATEX) -> MixFormat {
             fmt = "s16le";
         } else if w.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
             let ext = std::ptr::read_unaligned(wf as *const WAVEFORMATEXTENSIBLE);
-            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT has Data1 == 3
+            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT has data1 == 3
             if ext.SubFormat.data1 != 3 {
                 fmt = "s16le";
             }
@@ -73,7 +71,7 @@ fn parse_wf(wf: *const WAVEFORMATEX) -> MixFormat {
 
 pub fn query_mix_format(source: Source) -> Result<MixFormat> {
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let device = device_for(source)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let wf = client.GetMixFormat()?;
@@ -86,61 +84,26 @@ pub fn query_mix_format(source: Source) -> Result<MixFormat> {
     }
 }
 
-pub struct AudioCapture {
-    stop: Arc<AtomicBool>,
-}
-
-impl AudioCapture {
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-}
-
-pub fn create_pipe(name: &str) -> Result<HANDLE> {
-    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        let handle = CreateNamedPipeW(
-            PCWSTR(wide.as_ptr()),
-            PIPE_ACCESS_OUTBOUND,
-            windows::Win32::System::Pipes::PIPE_TYPE_BYTE
-                | windows::Win32::System::Pipes::PIPE_READMODE_BYTE
-                | windows::Win32::System::Pipes::PIPE_WAIT,
-            1,
-            0,
-            4 * 1024 * 1024,
-            0,
-            None,
-        );
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(anyhow!("CreateNamedPipeW failed"));
-        }
-        Ok(handle)
-    }
-}
-
-pub fn start(source: Source, pipe: HANDLE, stop: Arc<AtomicBool>) {
-    let pipe_raw = pipe.0 as isize;
+/// Capture one source into a raw PCM file until `stop` is set or writes fail.
+pub fn start(source: Source, path: PathBuf, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let pipe = HANDLE(pipe_raw as *mut c_void);
-        if let Err(e) = run_capture(source, pipe, &stop) {
+        if let Err(e) = run_capture(source, &path, &stop) {
             eprintln!("[audio] {source:?} capture ended: {e}");
-        }
-        unsafe {
-            let _ = CloseHandle(pipe);
         }
     });
 }
 
-fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
+fn run_capture(source: Source, path: &Path, stop: &AtomicBool) -> Result<()> {
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let device = device_for(source)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let wf = client.GetMixFormat()?;
         if wf.is_null() {
             return Err(anyhow!("null mix format"));
         }
-        let block_align = (*wf).nBlockAlign as usize;
+        let mf = parse_wf(wf);
+        let block_align = mf.block_align;
         let flags = match source {
             Source::Loopback => AUDCLNT_STREAMFLAGS_LOOPBACK,
             Source::Mic => 0,
@@ -150,10 +113,11 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
         let capture: IAudioCaptureClient = client.GetService()?;
         client.Start()?;
 
-        if ConnectNamedPipe(pipe, None).is_err() {
-            client.Stop().ok();
-            return Err(anyhow!("ffmpeg never connected to audio pipe"));
-        }
+        let mut file = File::create(path)?;
+        let mut last_write = std::time::Instant::now();
+        // WASAPI loopback delivers nothing while the system is silent;
+        // synthesize silence so the stream stays continuous in real time.
+        let silence_chunk = vec![0u8; (mf.rate / 50) as usize * block_align];
 
         while !stop.load(Ordering::SeqCst) {
             let packets = match capture.GetNextPacketSize() {
@@ -161,7 +125,13 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
                 Err(_) => break,
             };
             if packets == 0 {
-                std::thread::sleep(Duration::from_millis(10));
+                if last_write.elapsed() >= Duration::from_millis(20) {
+                    if file.write_all(&silence_chunk).is_err() {
+                        break;
+                    }
+                    last_write = std::time::Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
             for _ in 0..packets {
@@ -170,24 +140,18 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
                 let mut flags = 0u32;
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let len = frames as usize * block_align;
-                let mut written = 0u32;
                 let res = if len == 0 {
                     Ok(())
                 } else if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
-                    WriteFile(pipe, Some(&vec![0u8; len]), Some(&mut written), None)
+                    file.write_all(&vec![0u8; len])
                 } else {
-                    WriteFile(
-                        pipe,
-                        Some(std::slice::from_raw_parts(data, len)),
-                        Some(&mut written),
-                        None,
-                    )
+                    file.write_all(std::slice::from_raw_parts(data, len))
                 };
                 let _ = capture.ReleaseBuffer(frames);
                 if res.is_err() {
-                    client.Stop().ok();
-                    return Ok(()); // ffmpeg closed the pipe: recording finished
+                    break;
                 }
+                last_write = std::time::Instant::now();
             }
         }
         client.Stop().ok();
