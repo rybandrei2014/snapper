@@ -67,10 +67,11 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   Snipping Tool). Triggered from the Record/Screenshot chooser after a region is selected.
 - **Audio:** WASAPI capture (`IAudioClient`) on the default render endpoint with
   `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic).
-  Each source is written to a raw PCM file during recording (silence is synthesized while the
-  system is quiet); at finalize the files are concatenated, mixed via `amix` when a mic track
-  exists, and muxed to AAC. If a source fails, recording degrades (mic-only failure → system
-  audio only; audio failure → video-only).
+  Each source is streamed as raw PCM over a named pipe **into the same ffmpeg process** that captures
+  video, so ffmpeg timestamps audio and video on one clock (A/V stay in sync). With mic enabled the
+  two are mixed via `amix`. Silence is synthesized while the system is quiet so sample-count
+  timestamps keep tracking wall-clock time. If a source fails, recording degrades (mic-only failure →
+  system audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
   selection overlay and the click-through recording border; a topmost floating control bar
   (Pause/Resume · Stop) anchored just outside the region; `tray-icon` for the tray;
@@ -78,5 +79,5 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
 - **Stop / pause:** `q` is written to ffmpeg's stdin, producing a clean, valid MP4; completion is
   detected by polling the child process from the message loop. Pause simply ends the current
   segment; resume starts a new one; on stop, segments are joined with the `concat` demuxer
-  (`-c copy`) plus the audio mux, so the result is one continuous file. ffmpeg children are
-  assigned to a Win32 job object so they can never outlive the app.
+  (`-c copy`) — each segment is already muxed (video+audio), so the join is instant. ffmpeg children
+  are assigned to a Win32 job object so they can never outlive the app.

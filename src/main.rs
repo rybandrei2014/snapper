@@ -62,7 +62,6 @@ struct Recording {
     params: capture::SegParams,
     base: PathBuf,
     segments: Vec<capture::SegEntry>,
-    audio_fmt: Option<audio::MixFormat>,
     seq: u32,
     seg: Option<capture::Segment>,
     retried: bool,
@@ -239,7 +238,7 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_millis(500));
         }
         rec.seg = None;
-        let _ = capture::finalize(&app.cfg, &rec.base, &rec.segments, rec.audio_fmt);
+        let _ = capture::finalize(&app.cfg, &rec.base, &rec.segments);
     }
     Ok(())
 }
@@ -302,11 +301,8 @@ fn toggle_pause(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
             let seg_path = segment_path(&rec.base, rec.seq);
             let enc = if rec.retried { Some("libx264") } else { None };
             match capture::start_segment(&app.cfg, rec.params, &seg_path, enc) {
-                Ok((seg, entry, fmt)) => {
+                Ok((seg, entry)) => {
                     rec.segments.push(entry);
-                    if rec.audio_fmt.is_none() {
-                        rec.audio_fmt = fmt;
-                    }
                     rec.seg = Some(seg);
                     app.mode = Mode::Recording;
                     update_menu(app.mode, items);
@@ -419,12 +415,11 @@ fn on_ctl(app: &mut App, id: usize, tray: &TrayIcon, items: &MenuItems) {
 fn start_recording(app: &mut App, pend: PendingSel, main: HWND, tray: &TrayIcon, items: &MenuItems) {
     let seg_path = segment_path(&pend.base, 0);
     match capture::start_segment(&app.cfg, pend.params, &seg_path, None) {
-        Ok((seg, entry, fmt)) => {
+        Ok((seg, entry)) => {
             app.recording = Some(Recording {
                 params: pend.params,
                 base: pend.base,
                 segments: vec![entry],
-                audio_fmt: fmt,
                 seq: 0,
                 seg: Some(seg),
                 retried: false,
@@ -489,18 +484,12 @@ fn poll_segment(app: &mut App, tray: &TrayIcon, items: &MenuItems) {
             if let Some(bad) = rec.segments.pop() {
                 let _ = std::fs::remove_file(&bad.video);
                 let _ = std::fs::remove_file(bad.video.with_extension("ffmpeg.log"));
-                for a in &bad.audio {
-                    let _ = std::fs::remove_file(a);
-                }
             }
             eprintln!("[app] segment crashed, retrying with libx264");
             let seg_path = segment_path(&rec.base, rec.seq);
             match capture::start_segment(&app.cfg, rec.params, &seg_path, Some("libx264")) {
-                Ok((seg, entry, fmt)) => {
+                Ok((seg, entry)) => {
                     rec.segments.push(entry);
-                    if rec.audio_fmt.is_none() {
-                        rec.audio_fmt = fmt;
-                    }
                     rec.seg = Some(seg);
                     let _ = tray.set_tooltip(Some("Snapper — recording (recovered)"));
                     return;
@@ -536,7 +525,7 @@ fn finalize(app: &mut App, tray: &TrayIcon) {
             return;
         }
     };
-    match capture::finalize(&app.cfg, &rec.base, &rec.segments, rec.audio_fmt) {
+    match capture::finalize(&app.cfg, &rec.base, &rec.segments) {
         Ok(()) => {
             app.last_out = Some(rec.base.clone());
             let label = rec

@@ -130,12 +130,17 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - Not yet: live size label during drag, resize handles, floating control bar (tray/hotkey stop instead)
 
 ### M2 — Audio & recording features (core done 2026-10-22)
-- [x] System (loopback) audio: WASAPI → raw PCM file per segment → AAC muxed at finalize
-      (48 kHz stereo, mix format auto-detected; `audio: false` switch; silence padding keeps the
-      stream continuous while the system is quiet) ✅ verified: 440 Hz tone → mean −23 dB in output
-- [x] Mic input mixed with loopback (second WASAPI capture → second raw file → `amix` at finalize;
+- [x] System (loopback) audio: WASAPI → raw PCM **named pipe into the same ffmpeg** → AAC, so ffmpeg
+      timestamps A/V on one clock (48 kHz stereo, mix format auto-detected; `audio: false` switch;
+      silence padding keeps the stream continuous while the system is quiet) ✅ verified: 440 Hz tone
+      → mean −23 dB in output
+- [x] Mic input mixed with loopback (second WASAPI capture → second pipe → `amix` inside ffmpeg;
       `mic: true` switch; degrades gracefully when no mic present) ✅ amix graph verified; real-mic
       path untested (dev machine has no capture device)
+- [x] **A/V sync fix:** audio now shares ffmpeg's clock (was: separate raw-file capture started
+      ~1.2 s after video → sound led picture by ~1.2 s). `test_sync.ps1` measures flash-vs-tone
+      offset in a recording: now ~50–150 ms (was ~1200 ms); residual is near the perceptual
+      threshold and partly the test player's own output latency.
 - [x] Pause/resume with segment concat: `Win+Alt+P` (fallback `Ctrl+Alt+P`; `Win+Shift+P` is the
       Windows display-switch hotkey — do not use), tray Pause/Resume/Stop with enable states ✅
       verified: 3 s + pause 2 s + 1.5 s → single 4.5 s MP4 with audio, twice in a row
@@ -201,6 +206,7 @@ snapper/
     config.rs     # %APPDATA%\Snapper\config.json
   e2e_test.ps1    # injected-input end-to-end test (hotkey + drag + record + ffprobe check)
   test_shot.ps1   # injected-input screenshot test (hotkey + drag + chooser + ffprobe check)
+  test_sync.ps1   # A/V sync test (flash+beep clip, measures audio-vs-video offset)
   plan.md  design.md  README.md
   target/release/snapper.exe   # ~0.6 MB; ship ffmpeg.exe beside it
 ```

@@ -6,7 +6,7 @@ use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::JobObjects::{
@@ -37,10 +37,13 @@ fn ffmpeg_job() -> HANDLE {
     HANDLE(raw as *mut core::ffi::c_void)
 }
 
+static PIPE_SEQ: AtomicU32 = AtomicU32::new(0);
+
 pub struct Segment {
     child: Child,
     stdin: Option<ChildStdin>,
     audio_stops: Vec<Arc<AtomicBool>>,
+    audio_pipes: Vec<isize>,
 }
 
 impl Segment {
@@ -50,8 +53,17 @@ impl Segment {
             let _ = s.write_all(b"q\n");
             let _ = s.flush();
         }
+        self.shutdown_audio();
+    }
+
+    fn shutdown_audio(&mut self) {
         for flag in &self.audio_stops {
             flag.store(true, Ordering::SeqCst);
+        }
+        // Closing the server pipe unblocks any capture thread still in
+        // ConnectNamedPipe and makes in-flight writes fail.
+        for h in self.audio_pipes.drain(..) {
+            audio::close_pipe(h);
         }
     }
 
@@ -64,6 +76,12 @@ impl Segment {
     }
 }
 
+impl Drop for Segment {
+    fn drop(&mut self) {
+        self.shutdown_audio();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct SegParams {
     pub x: i32,
@@ -73,15 +91,10 @@ pub struct SegParams {
     pub output_idx: i32,
 }
 
-/// One recorded segment: video file plus optional raw audio files.
+/// One recorded segment: a single muxed (video+audio) mp4.
 #[derive(Clone)]
 pub struct SegEntry {
     pub video: PathBuf,
-    pub audio: Vec<PathBuf>,
-}
-
-pub fn audio_path(video: &Path, source: &str) -> PathBuf {
-    video.with_extension(format!("audio.{source}"))
 }
 
 struct Variant {
@@ -119,12 +132,99 @@ fn variants(p: SegParams, fps: u32) -> Vec<Variant> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_args(
+    variant: &Variant,
+    encoder: &str,
+    audio: &[(Source, MixFormat)],
+    pipes: &[String],
+    seg_path: &Path,
+    cfg: &Config,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        variant.input.clone(),
+    ];
+    // audio inputs (each fed live from a named pipe)
+    for ((_, mf), name) in audio.iter().zip(pipes.iter()) {
+        args.extend([
+            "-f".into(),
+            mf.ffmpeg_fmt.into(),
+            "-ar".into(),
+            mf.rate.to_string(),
+            "-ac".into(),
+            mf.channels.to_string(),
+            "-i".into(),
+            name.clone(),
+        ]);
+    }
+    // -vf is an output-side filter: must come after ALL inputs
+    if let Some(vf) = &variant.vf {
+        args.extend(["-vf".into(), vf.clone()]);
+    }
+    // stream mapping
+    match audio.len() {
+        0 => args.push("-an".into()),
+        1 => args.extend(["-map".into(), "0:v".into(), "-map".into(), "1:a".into()]),
+        _ => args.extend([
+            "-filter_complex".into(),
+            "[1:a][2:a]amix=inputs=2:duration=longest[a]".into(),
+            "-map".into(),
+            "0:v".into(),
+            "-map".into(),
+            "[a]".into(),
+        ]),
+    }
+    // video encoder
+    if encoder == "libx264" {
+        args.extend([
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            "veryfast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ]);
+    } else {
+        args.extend([
+            "-c:v".into(),
+            "h264_mf".into(),
+            "-b:v".into(),
+            format!("{}K", cfg.bitrate_kbps),
+            "-pix_fmt".into(),
+            "nv12".into(),
+        ]);
+    }
+    if !audio.is_empty() {
+        args.extend([
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{}K", cfg.audio_bitrate_kbps),
+        ]);
+    }
+    args.extend([
+        "-f".into(),
+        "mp4".into(),
+        "-y".into(),
+        seg_path.display().to_string(),
+    ]);
+    args
+}
+
 pub fn start_segment(
     cfg: &Config,
     p: SegParams,
     seg_path: &Path,
     encoder_override: Option<&str>,
-) -> Result<(Segment, SegEntry, Option<MixFormat>)> {
+) -> Result<(Segment, SegEntry)> {
     let ffmpeg = util::find_ffmpeg(cfg)?;
     if let Some(dir) = seg_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -151,111 +251,117 @@ pub fn start_segment(
         },
     };
 
-    // audio: capture to raw files (no pipes); mixed/muxed at finalize
-    let audio_specs: Vec<(Source, PathBuf, MixFormat)> = {
+    // audio sources + formats (queried once; pipes created per attempt)
+    let audio_specs: Vec<(Source, MixFormat)> = {
         let mut v = Vec::new();
         if cfg.audio {
             match audio::query_mix_format(Source::Loopback) {
-                Ok(mf) => v.push((Source::Loopback, audio_path(seg_path, "sys"), mf)),
+                Ok(mf) => v.push((Source::Loopback, mf)),
                 Err(e) => eprintln!("[audio] unavailable, recording without sound: {e}"),
             }
         }
         if cfg.mic && !v.is_empty() {
             match audio::query_mix_format(Source::Mic) {
-                Ok(mf) => v.push((Source::Mic, audio_path(seg_path, "mic"), mf)),
+                Ok(mf) => v.push((Source::Mic, mf)),
                 Err(e) => eprintln!("[audio] mic unavailable: {e}"),
             }
         }
         v
     };
-    let primary_fmt = audio_specs.first().map(|(_, _, mf)| *mf);
-
-    let spawn = |variant: &Variant, encoder: &str, vi: usize| -> Result<(Child, ChildStdin)> {
-        let mut args: Vec<String> = vec![
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "error".into(),
-            "-f".into(),
-            "lavfi".into(),
-            "-i".into(),
-            variant.input.clone(),
-        ];
-        if let Some(vf) = &variant.vf {
-            args.extend(["-vf".into(), vf.clone()]);
-        }
-        if encoder == "libx264" {
-            args.extend([
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "veryfast".into(),
-                "-crf".into(),
-                "23".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-            ]);
-        } else {
-            args.extend([
-                "-c:v".into(),
-                "h264_mf".into(),
-                "-b:v".into(),
-                format!("{}K", cfg.bitrate_kbps),
-                "-pix_fmt".into(),
-                "nv12".into(),
-            ]);
-        }
-        args.extend([
-            "-an".into(),
-            "-f".into(),
-            "mp4".into(),
-            "-y".into(),
-            seg_path.display().to_string(),
-        ]);
-
-        let log_path = seg_path.with_extension(format!("v{vi}.{encoder}.log"));
-        let log_file = std::fs::File::create(&log_path).ok();
-        let mut child = Command::new(&ffmpeg)
-            .args(&args)
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(match log_file {
-                Some(f) => Stdio::from(f),
-                None => Stdio::null(),
-            })
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn {ffmpeg:?}: {e}"))?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin pipe"))?;
-        let job = ffmpeg_job();
-        if job != INVALID_HANDLE_VALUE {
-            unsafe {
-                let ph = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id())
-                    .unwrap_or(INVALID_HANDLE_VALUE);
-                if ph != INVALID_HANDLE_VALUE {
-                    let _ = AssignProcessToJobObject(job, ph);
-                    let _ = CloseHandle(ph);
-                }
-            }
-        }
-        Ok((child, stdin))
-    };
 
     let mut last_err = String::new();
-    let mut started: Option<(Child, ChildStdin)> = None;
+    let mut started: Option<(Child, ChildStdin, Vec<Arc<AtomicBool>>, Vec<isize>)> = None;
 
     for (vi, variant) in variants(p, cfg.fps).iter().enumerate() {
         for encoder in &encoders {
-            let (mut child, stdin) = match spawn(variant, encoder, vi) {
-                Ok(v) => v,
+            // fresh pipes for this attempt
+            let mut pipe_handles: Vec<isize> = Vec::new();
+            let mut pipe_names: Vec<String> = Vec::new();
+            let mut pipes_ok = true;
+            for _ in 0..audio_specs.len() {
+                let name = format!(
+                    r"\\.\pipe\snapper-{}-{}",
+                    std::process::id(),
+                    PIPE_SEQ.fetch_add(1, Ordering::Relaxed)
+                );
+                match audio::create_pipe(&name) {
+                    Ok(h) => {
+                        pipe_handles.push(h);
+                        pipe_names.push(name);
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        pipes_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !pipes_ok {
+                for h in pipe_handles {
+                    audio::close_pipe(h);
+                }
+                continue;
+            }
+
+            let args = build_args(variant, encoder, &audio_specs, &pipe_names, seg_path, cfg);
+            let log_path = seg_path.with_extension(format!("v{vi}.{encoder}.log"));
+            let log_file = std::fs::File::create(&log_path).ok();
+            let spawn_res = Command::new(&ffmpeg)
+                .args(&args)
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(match log_file {
+                    Some(f) => Stdio::from(f),
+                    None => Stdio::null(),
+                })
+                .spawn()
+                .map_err(|e| anyhow!("failed to spawn {ffmpeg:?}: {e}"));
+            let mut child = match spawn_res {
+                Ok(c) => c,
                 Err(e) => {
                     last_err = e.to_string();
+                    for h in pipe_handles {
+                        audio::close_pipe(h);
+                    }
                     continue;
                 }
             };
+            let stdin = match child.stdin.take() {
+                Some(s) => s,
+                None => {
+                    last_err = "no stdin pipe".into();
+                    let _ = child.kill();
+                    for h in pipe_handles {
+                        audio::close_pipe(h);
+                    }
+                    continue;
+                }
+            };
+            let job = ffmpeg_job();
+            if job != INVALID_HANDLE_VALUE {
+                unsafe {
+                    let ph = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, child.id())
+                        .unwrap_or(INVALID_HANDLE_VALUE);
+                    if ph != INVALID_HANDLE_VALUE {
+                        let _ = AssignProcessToJobObject(job, ph);
+                        let _ = CloseHandle(ph);
+                    }
+                }
+            }
+
+            // start audio capture threads; each blocks in ConnectNamedPipe
+            // until ffmpeg opens that input, then streams in real time.
+            let mut audio_stops = Vec::new();
+            for (si, (src, _)) in audio_specs.iter().enumerate() {
+                let flag = Arc::new(AtomicBool::new(false));
+                audio::start(*src, pipe_handles[si], flag.clone());
+                audio_stops.push(flag);
+            }
 
             // health window: bad variants (bad options, filter format errors)
-            // exit within ~1s. Do NOT gate on file size: static screens
-            // encode to near-zero bitrate and flush the mp4 only much later.
+            // exit within ~1s. Do NOT gate on file size: static screens encode
+            // to near-zero bitrate and flush the mp4 only much later.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
             let mut alive = true;
             while std::time::Instant::now() < deadline {
@@ -267,39 +373,37 @@ pub fn start_segment(
                 }
             }
             if alive {
-                started = Some((child, stdin));
+                started = Some((child, stdin, audio_stops, pipe_handles));
                 break;
             }
+
+            // attempt failed: kill ffmpeg, stop+unblock audio threads
             let _ = child.kill();
+            for f in &audio_stops {
+                f.store(true, Ordering::SeqCst);
+            }
+            for h in &pipe_handles {
+                audio::close_pipe(*h);
+            }
         }
         if started.is_some() {
             break;
         }
     }
 
-    let (child, stdin) = started.ok_or_else(|| anyhow!("no working capture: {last_err}"))?;
-
-    // start audio capture threads writing raw files for this segment
-    let mut audio_stops = Vec::new();
-    let mut audio_files = Vec::new();
-    for (source, path, _mf) in &audio_specs {
-        let flag = Arc::new(AtomicBool::new(false));
-        audio::start(*source, path.clone(), flag.clone());
-        audio_stops.push(flag);
-        audio_files.push(path.clone());
-    }
+    let (child, stdin, audio_stops, audio_pipes) =
+        started.ok_or_else(|| anyhow!("no working capture: {last_err}"))?;
 
     Ok((
         Segment {
             child,
             stdin: Some(stdin),
             audio_stops,
+            audio_pipes,
         },
         SegEntry {
             video: seg_path.to_path_buf(),
-            audio: audio_files,
         },
-        primary_fmt,
     ))
 }
 
@@ -344,13 +448,8 @@ pub fn grab_frame(cfg: &Config, p: SegParams, out: &Path) -> Result<()> {
     Err(anyhow!("no working frame grab: {last_err}"))
 }
 
-/// Join finished segments into the final file and remove intermediates.
-pub fn finalize(
-    cfg: &Config,
-    base: &Path,
-    segments: &[SegEntry],
-    audio_fmt: Option<MixFormat>,
-) -> Result<()> {
+/// Join finished (already muxed) segments into the final file.
+pub fn finalize(cfg: &Config, base: &Path, segments: &[SegEntry]) -> Result<()> {
     let good: Vec<&SegEntry> = segments
         .iter()
         .filter(|s| std::fs::metadata(&s.video).map(|m| m.len() > 1024).unwrap_or(false))
@@ -365,10 +464,8 @@ pub fn finalize(
         return Err(anyhow!("no valid segments"));
     }
 
-    // 1. video: single segment → rename, else concat demuxer (stream copy)
-    let video_only = base.with_extension("video.tmp.mp4");
     if good.len() == 1 {
-        std::fs::rename(&good[0].video, &video_only)?;
+        std::fs::rename(&good[0].video, base)?;
     } else {
         let list = base.with_extension("concat.txt");
         let mut text = String::new();
@@ -391,7 +488,7 @@ pub fn finalize(
                 "-c",
                 "copy",
                 "-y",
-                &video_only.display().to_string(),
+                &base.display().to_string(),
             ])
             .creation_flags(0x0800_0000)
             .status()?;
@@ -399,95 +496,6 @@ pub fn finalize(
         if !status.success() {
             return Err(anyhow!("concat failed: {status}"));
         }
-    }
-
-    // 2. audio: raw files concatenate trivially; loopback + mic mixed via amix
-    let ffmpeg = util::find_ffmpeg(cfg)?;
-    let have_audio: Vec<&PathBuf> = good
-        .iter()
-        .flat_map(|s| s.audio.iter())
-        .filter(|p| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
-        .collect();
-
-    if let (Some(mf), true) = (audio_fmt, !have_audio.is_empty()) {
-        // concatenate each source's raw files across segments
-        let sys_raw = base.with_extension("sys.raw");
-        let mic_raw = base.with_extension("mic.raw");
-        let mut sys = std::fs::File::create(&sys_raw)?;
-        let mut mic = std::fs::File::create(&mic_raw)?;
-        let mut mic_created = false;
-        for s in &good {
-            for p in &s.audio {
-                let is_mic = p.extension().map(|e| e == "mic").unwrap_or(false);
-                let target: &mut std::fs::File = if is_mic {
-                    mic_created = true;
-                    &mut mic
-                } else {
-                    &mut sys
-                };
-                if let Ok(data) = std::fs::read(p) {
-                    let _ = target.write_all(&data);
-                }
-            }
-        }
-        drop(sys);
-        drop(mic);
-
-        let fmt_args = |raw: &Path| -> Vec<String> {
-            vec![
-                "-f".into(),
-                mf.ffmpeg_fmt.into(),
-                "-ar".into(),
-                mf.rate.to_string(),
-                "-ac".into(),
-                mf.channels.to_string(),
-                "-i".into(),
-                raw.display().to_string(),
-            ]
-        };
-        let mut args: Vec<String> =
-            vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
-        args.extend(["-i".into(), video_only.display().to_string()]);
-        args.extend(fmt_args(&sys_raw));
-        if mic_created {
-            args.extend(fmt_args(&mic_raw));
-            args.extend([
-                "-filter_complex".into(),
-                "[1:a][2:a]amix=inputs=2:duration=longest[aout]".into(),
-                "-map".into(),
-                "0:v".into(),
-                "-map".into(),
-                "[aout]".into(),
-            ]);
-        } else {
-            args.extend(["-map".into(), "0:v".into(), "-map".into(), "1:a".into()]);
-        }
-        args.extend([
-            "-c:v".into(),
-            "copy".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{}K", cfg.audio_bitrate_kbps),
-            "-shortest".into(),
-            "-y".into(),
-            base.display().to_string(),
-        ]);
-        let status = Command::new(&ffmpeg)
-            .args(&args)
-            .creation_flags(0x0800_0000)
-            .status()?;
-        let _ = std::fs::remove_file(&sys_raw);
-        let _ = std::fs::remove_file(&mic_raw);
-        if !status.success() {
-            // fall back to silent video rather than losing the recording
-            eprintln!("[finalize] audio mux failed ({status}); keeping video");
-            std::fs::rename(&video_only, base)?;
-        } else {
-            let _ = std::fs::remove_file(&video_only);
-        }
-    } else {
-        std::fs::rename(&video_only, base)?;
     }
 
     for s in segments {
@@ -498,9 +506,6 @@ pub fn finalize(
 
 fn cleanup(s: &SegEntry) {
     let _ = std::fs::remove_file(&s.video);
-    for a in &s.audio {
-        let _ = std::fs::remove_file(a);
-    }
     if let (Some(dir), Some(name)) = (s.video.parent(), s.video.file_stem()) {
         let prefix = format!("{}.", name.to_string_lossy());
         if let Ok(rd) = std::fs::read_dir(dir) {

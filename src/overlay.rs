@@ -447,7 +447,7 @@ pub fn show_action_bar(main: HWND, rect: RECT) {
 
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let btn_cls = wide("BUTTON");
-        let mut mk = |label: &str, id: usize, bx: i32| {
+        let mk = |label: &str, id: usize, bx: i32| {
             let w = wide(label);
             let b = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -548,7 +548,7 @@ pub fn show_ctl_bar(main: HWND, rect: RECT) {
 
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let btn_cls = wide("BUTTON");
-        let mut mk = |label: &str, id: usize, bx: i32| {
+        let mk = |label: &str, id: usize, bx: i32| {
             let w = wide(label);
             let b = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
