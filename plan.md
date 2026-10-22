@@ -123,13 +123,17 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - [x] `e2e_test.ps1`: injects hotkey + mouse drag, verifies output with ffprobe — **passing**
 - Not yet: live size label during drag, resize handles, floating control bar (tray/hotkey stop instead)
 
-### M2 — Audio & recording features (next)
-- [ ] NAudio loopback capture → PCM pipe; device-disconnect resilience.
-- [ ] Optional mic, mixed with loopback (volume knobs in settings).
-- [ ] Pause/resume with segment concat.
-- [ ] Countdown timer, `Win+Shift+R` to stop, re-select-last-region (`Win+Shift+G`).
-- [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV.
-- [ ] Per-monitor DPI correctness across mixed-DPI multi-monitor setups.
+### M2 — Audio & recording features (in progress)
+- [x] WASAPI loopback capture → named pipe → ffmpeg → AAC (48 kHz stereo, mix format auto-detected;
+      `audio: false` config switch; auto-retry chain without audio if it fails) ✅ 2026-10-22
+- [x] Mic input mixed with loopback (second WASAPI capture → second pipe → `amix`; `mic: true`
+      switch; degrades gracefully when no mic present) ✅ 2026-10-22 — amix graph verified with
+      synthetic sources; real-mic path untested (dev machine has no capture device)
+- [ ] Per-source volume knobs in settings
+- [ ] Pause/resume with segment concat
+- [ ] Countdown timer, re-select-last-region (`Win+Shift+G`)
+- [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV
+- [ ] Per-monitor DPI correctness across mixed-DPI multi-monitor setups
 - **Acceptance:** A/V in sync after 10-min recording; pause/resume produces one valid file.
 
 ### M3 — v1.0 release polish (2–3 weeks)

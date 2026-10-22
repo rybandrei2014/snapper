@@ -7,8 +7,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, eConsole, eRender, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, eCapture, eConsole, eRender,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::Storage::FileSystem::PIPE_ACCESS_OUTBOUND;
 use windows::Win32::System::Com::{
@@ -30,11 +30,21 @@ pub struct MixFormat {
     pub ffmpeg_fmt: &'static str,
 }
 
-fn render_device() -> Result<IMMDevice> {
+#[derive(Debug, Clone, Copy)]
+pub enum Source {
+    Loopback,
+    Mic,
+}
+
+fn device_for(source: Source) -> Result<IMMDevice> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let (flow, _label) = match source {
+            Source::Loopback => (eRender, "render"),
+            Source::Mic => (eCapture, "capture"),
+        };
+        let device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)?;
         Ok(device)
     }
 }
@@ -61,10 +71,10 @@ fn parse_wf(wf: *const WAVEFORMATEX) -> MixFormat {
     }
 }
 
-pub fn query_mix_format() -> Result<MixFormat> {
+pub fn query_mix_format(source: Source) -> Result<MixFormat> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED);
-        let device = render_device()?;
+        let device = device_for(source)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let wf = client.GetMixFormat()?;
         if wf.is_null() {
@@ -108,12 +118,12 @@ pub fn create_pipe(name: &str) -> Result<HANDLE> {
     }
 }
 
-pub fn start(pipe: HANDLE, stop: Arc<AtomicBool>) {
+pub fn start(source: Source, pipe: HANDLE, stop: Arc<AtomicBool>) {
     let pipe_raw = pipe.0 as isize;
     std::thread::spawn(move || {
         let pipe = HANDLE(pipe_raw as *mut c_void);
-        if let Err(e) = run_loopback(pipe, &stop) {
-            eprintln!("[audio] loopback capture ended: {e}");
+        if let Err(e) = run_capture(source, pipe, &stop) {
+            eprintln!("[audio] {source:?} capture ended: {e}");
         }
         unsafe {
             let _ = CloseHandle(pipe);
@@ -121,24 +131,21 @@ pub fn start(pipe: HANDLE, stop: Arc<AtomicBool>) {
     });
 }
 
-fn run_loopback(pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
+fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED);
-        let device = render_device()?;
+        let device = device_for(source)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let wf = client.GetMixFormat()?;
         if wf.is_null() {
             return Err(anyhow!("null mix format"));
         }
         let block_align = (*wf).nBlockAlign as usize;
-        client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            0,
-            0,
-            wf,
-            None,
-        )?;
+        let flags = match source {
+            Source::Loopback => AUDCLNT_STREAMFLAGS_LOOPBACK,
+            Source::Mic => 0,
+        };
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wf, None)?;
         CoTaskMemFree(Some(wf as *const c_void));
         let capture: IAudioCaptureClient = client.GetService()?;
         client.Start()?;

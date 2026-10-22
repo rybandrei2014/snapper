@@ -30,6 +30,7 @@ Not yet implemented (see plan.md): microphone input, pause/resume, countdown, se
 | `bitrate_kbps` | 12000 | video bitrate for `h264_mf` |
 | `encoder` | `auto` | `auto` (h264_mf → libx264 fallback), `h264_mf`, or `libx264` |
 | `audio` | true | capture system audio (WASAPI loopback of default render device) |
+| `mic` | false | also capture the default microphone and mix it with system audio |
 | `audio_bitrate_kbps` | 192 | AAC bitrate |
 | `output_dir` | `%USERPROFILE%\Videos\Snapper` | output folder |
 | `ffmpeg_path` | null | explicit ffmpeg.exe path |
@@ -53,9 +54,11 @@ powershell -ExecutionPolicy Bypass -File e2e_test.ps1
   `offset_x/offset_y/video_size` for the region and `hwdownload,format=bgra` to pull D3D11 frames
   to system memory. A fallback chain (region options → crop filter; `h264_mf` → `libx264`) adapts
   to older ffmpeg builds automatically.
-- **Audio:** WASAPI loopback capture (`IAudioClient` with `AUDCLNT_STREAMFLAGS_LOOPBACK`) on the
-  default render endpoint, streamed as raw PCM/float over a named pipe into ffmpeg → AAC.
-  If the audio setup fails, recording automatically retries video-only.
+- **Audio:** WASAPI capture (`IAudioClient`) on the default render endpoint with
+  `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic),
+  each streamed as raw PCM/float over its own named pipe into ffmpeg; with mic enabled the two
+  streams are mixed via `amix`. If a source fails, recording degrades (mic-only failure → system
+  audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
   selection overlay and the click-through recording border; `tray-icon` for the tray;
   `RegisterHotKey` for the global hotkey. Single instance via a named mutex.

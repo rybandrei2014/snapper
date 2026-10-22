@@ -1,4 +1,4 @@
-use crate::audio::{self, MixFormat};
+use crate::audio::{self, MixFormat, Source};
 use crate::config::Config;
 use crate::util;
 use crate::WM_APP_REC_STOPPED;
@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 pub struct Recorder {
     stdin: Option<ChildStdin>,
-    audio_stop: Option<Arc<AtomicBool>>,
+    audio_stops: Vec<Arc<AtomicBool>>,
     pub out_path: PathBuf,
 }
 
@@ -24,7 +24,7 @@ impl Recorder {
             let _ = s.write_all(b"q\n");
             let _ = s.flush();
         }
-        if let Some(flag) = &self.audio_stop {
+        for flag in &self.audio_stops {
             flag.store(true, Ordering::SeqCst);
         }
     }
@@ -92,7 +92,7 @@ pub fn start(
     };
 
     let audio_mf = if cfg.audio {
-        match audio::query_mix_format() {
+        match audio::query_mix_format(Source::Loopback) {
             Ok(mf) => Some(mf),
             Err(e) => {
                 eprintln!("[audio] unavailable, recording without sound: {e}");
@@ -102,10 +102,21 @@ pub fn start(
     } else {
         None
     };
+    let mic_mf = if audio_mf.is_some() && cfg.mic {
+        match audio::query_mix_format(Source::Mic) {
+            Ok(mf) => Some(mf),
+            Err(e) => {
+                eprintln!("[audio] mic unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let spawn = |variant: &Variant,
                  encoder: &str,
-                 audio_in: Option<(&MixFormat, &str)>|
+                 audio_in: &[(&MixFormat, String)]|
      -> Result<(Child, ChildStdin)> {
         let mut args: Vec<String> = vec![
             "-hide_banner".into(),
@@ -116,7 +127,7 @@ pub fn start(
             "-i".into(),
             variant.input.clone(),
         ];
-        if let Some((mf, pipe)) = audio_in {
+        for (mf, pipe) in audio_in {
             args.extend([
                 "-f".into(),
                 mf.ffmpeg_fmt.into(),
@@ -125,16 +136,37 @@ pub fn start(
                 "-ac".into(),
                 mf.channels.to_string(),
                 "-i".into(),
-                pipe.into(),
+                pipe.clone(),
             ]);
         }
-        args.extend(["-map".into(), "0:v".into()]);
-        if audio_in.is_some() {
-            args.extend(["-map".into(), "1:a".into()]);
+
+        let mut maps: Vec<String> = vec!["-map".into(), "0:v".into()];
+        if audio_in.len() == 2 {
+            // both video and audio go through one filter_complex
+            let amix = "[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a1];\
+                        [2:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a2];\
+                        [a1][a2]amix=inputs=2:duration=longest[aout]";
+            let fc = match &variant.vf {
+                Some(vf) => format!("[0:v]{vf}[vout];{amix}"),
+                None => amix.into(),
+            };
+            args.extend(["-filter_complex".into(), fc]);
+            maps = match &variant.vf {
+                Some(_) => vec!["-map".into(), "[vout]".into()],
+                None => vec!["-map".into(), "0:v".into()],
+            };
+            maps.extend(["-map".into(), "[aout]".into()]);
+        } else {
+            if let Some(vf) = &variant.vf {
+                args.extend(["-vf".into(), vf.clone()]);
+            }
+            if audio_in.len() == 1 {
+                maps.push("-map".into());
+                maps.push("1:a".into());
+            }
         }
-        if let Some(vf) = &variant.vf {
-            args.extend(["-vf".into(), vf.clone()]);
-        }
+        args.extend(maps);
+
         if encoder == "libx264" {
             args.extend([
                 "-c:v".into(),
@@ -156,7 +188,7 @@ pub fn start(
                 "nv12".into(),
             ]);
         }
-        if let Some((_, _)) = audio_in {
+        if !audio_in.is_empty() {
             args.extend([
                 "-c:a".into(),
                 "aac".into(),
@@ -188,7 +220,7 @@ pub fn start(
     let pid = std::process::id();
     let mut pipe_seq = 0u32;
     let mut last_err = String::new();
-    let mut started: Option<(Child, ChildStdin, Option<Arc<AtomicBool>>)> = None;
+    let mut started: Option<(Child, ChildStdin, Vec<Arc<AtomicBool>>)> = None;
 
     'outer: for use_audio in [true, false] {
         if use_audio && audio_mf.is_none() {
@@ -196,56 +228,72 @@ pub fn start(
         }
         for variant in variants(output_idx, cfg.fps, x, y, w, h) {
             for encoder in &encoders {
-                let audio_in = if use_audio {
+                // open one named pipe per enabled audio source
+                let mut pipes: Vec<(String, windows::Win32::Foundation::HANDLE)> = Vec::new();
+                if use_audio {
                     pipe_seq += 1;
-                    let pipe_name = format!(r"\\.\pipe\snapper-audio-{pid}-{pipe_seq}");
-                    match audio::create_pipe(&pipe_name) {
-                        Ok(handle) => Some((handle, pipe_name)),
+                    let name = format!(r"\\.\pipe\snapper-audio-{pid}-{pipe_seq}");
+                    match audio::create_pipe(&name) {
+                        Ok(h) => pipes.push((name, h)),
                         Err(e) => {
                             last_err = e.to_string();
                             continue;
                         }
                     }
-                } else {
-                    None
-                };
-
-                let (mut child, stdin) = match &audio_in {
-                    Some((_, name)) => {
-                        match spawn(&variant, encoder, Some((audio_mf.as_ref().unwrap(), name))) {
-                            Ok(v) => v,
+                    if mic_mf.is_some() {
+                        pipe_seq += 1;
+                        let name = format!(r"\\.\pipe\snapper-audio-{pid}-{pipe_seq}");
+                        match audio::create_pipe(&name) {
+                            Ok(h) => pipes.push((name, h)),
                             Err(e) => {
                                 last_err = e.to_string();
                                 continue;
                             }
                         }
                     }
-                    None => match spawn(&variant, encoder, None) {
+                }
+
+                let audio_refs: Vec<(&MixFormat, String)> = {
+                    let mut v: Vec<(&MixFormat, String)> = Vec::new();
+                    if use_audio {
+                        v.push((audio_mf.as_ref().unwrap(), pipes[0].0.clone()));
+                        if mic_mf.is_some() {
+                            v.push((mic_mf.as_ref().unwrap(), pipes[1].0.clone()));
+                        }
+                    }
+                    v
+                };
+
+                let (mut child, stdin) =
+                    match spawn(&variant, encoder, &audio_refs) {
                         Ok(v) => v,
                         Err(e) => {
                             last_err = e.to_string();
                             continue;
                         }
-                    },
-                };
+                    };
 
-                let audio_stop = if let Some((handle, _)) = &audio_in {
+                let mut audio_stops: Vec<Arc<AtomicBool>> = Vec::new();
+                for (i, (_, handle)) in pipes.iter().enumerate() {
                     let flag = Arc::new(AtomicBool::new(false));
-                    audio::start(*handle, flag.clone());
-                    Some(flag)
-                } else {
-                    None
-                };
+                    let source = if i == 0 {
+                        Source::Loopback
+                    } else {
+                        Source::Mic
+                    };
+                    audio::start(source, *handle, flag.clone());
+                    audio_stops.push(flag);
+                }
 
                 std::thread::sleep(std::time::Duration::from_millis(400));
                 match child.try_wait() {
                     Ok(None) => {
-                        started = Some((child, stdin, audio_stop));
+                        started = Some((child, stdin, audio_stops));
                         break 'outer;
                     }
                     Ok(Some(status)) => {
                         last_err = format!("ffmpeg {encoder} exited: {status}");
-                        if let Some(flag) = &audio_stop {
+                        for flag in &audio_stops {
                             flag.store(true, Ordering::SeqCst);
                         }
                     }
@@ -260,18 +308,18 @@ pub fn start(
         }
     }
 
-    let (child, stdin, audio_stop) =
+    let (child, stdin, audio_stops) =
         started.ok_or_else(|| anyhow!("no working capture pipeline: {last_err}"))?;
 
     let main_raw = main.0 as isize;
-    let watcher_audio = audio_stop.clone();
+    let watcher_audio = audio_stops.clone();
     std::thread::spawn(move || {
         let mut child = child;
         let code = child
             .wait()
             .map(|s| s.code().unwrap_or(0).max(0) as usize)
             .unwrap_or(1);
-        if let Some(flag) = &watcher_audio {
+        for flag in &watcher_audio {
             flag.store(true, Ordering::SeqCst);
         }
         let main = HWND(main_raw as *mut core::ffi::c_void);
@@ -282,7 +330,7 @@ pub fn start(
 
     Ok(Recorder {
         stdin: Some(stdin),
-        audio_stop,
+        audio_stops,
         out_path,
     })
 }
