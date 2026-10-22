@@ -31,6 +31,15 @@ must be on PATH or next to the exe) — ship it alongside for a portable bundle.
 
 There is no `cargo test` suite and no lints configured. Verify changes with the e2e scripts below.
 
+## Release / CI
+
+`.github/workflows/release.yml` (GitHub Actions, `windows-latest`): builds `--target
+x86_64-pc-windows-msvc`, downloads a pinned ffmpeg build (BtbN win64-gpl), copies `snapper.exe` +
+`ffmpeg.exe` + `ffprobe.exe` into a `dist/` folder, runs a **portability gate** (fails the build if
+the exe imports `VCRUNTIME140` or `api-ms-win-crt-*`), zips it, and publishes a GitHub Release on
+`v*` tags (also `workflow_dispatch` for manual runs). The e2e scripts are NOT run in CI (they need a
+real desktop session).
+
 ## Testing
 
 All tests are PowerShell scripts in the `tests/` folder. They drive the real `snapper.exe`

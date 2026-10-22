@@ -1,0 +1,72 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-bundle:
+    name: Build + bundle ffmpeg (win64)
+    runs-on: windows-latest
+    env:
+      # Pin an ffmpeg build for reproducible bundles. To pin a specific release,
+      # replace "latest" with a dated tag, e.g. n7.1-2024-xx-xx.
+      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+      FFMPEG_DIR: ffmpeg-master-latest-win64-gpl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release (static CRT via .cargo/config.toml)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        shell: pwsh
+
+      - name: Download ffmpeg
+        run: |
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_dl -Force
+        shell: pwsh
+
+      - name: Assemble portable bundle
+        run: |
+          $bin = "target\x86_64-pc-windows-msvc\release"
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "$bin\snapper.exe" dist\
+          Copy-Item "ffmpeg_dl\$env:FFMPEG_DIR\bin\ffmpeg.exe" dist\
+          Copy-Item "ffmpeg_dl\$env:FFMPEG_DIR\bin\ffprobe.exe" dist\
+          if (Test-Path README.md) { Copy-Item README.md dist\ }
+        shell: pwsh
+
+      - name: Portability gate (no VC runtime / UCRT imports)
+        run: |
+          $b = [IO.File]::ReadAllBytes("dist\snapper.exe")
+          $s = [Text.Encoding]::ASCII.GetString($b)
+          if ($s -match "VCRUNTIME140") { throw "snapper.exe imports VCRUNTIME140.dll - not portable" }
+          if ($s -match "api-ms-win-crt-") { throw "snapper.exe imports UCRT - not portable" }
+          "OK: imports only Windows-shipped DLLs"
+        shell: pwsh
+
+      - name: Zip bundle
+        run: Compress-Archive -Path dist\* -DestinationPath snapper-win64.zip -Force
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapper-win64
+          path: snapper-win64.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: snapper-win64.zip
+          generate_release_notes: true
