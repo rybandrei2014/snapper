@@ -112,7 +112,7 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 
 ### State machine
 
-`Idle → Selecting → Countdown(3-2-1, optional) → Recording ⇄ Paused → Finalizing → Idle`
+`Idle → Selecting → Choosing(Record/Screenshot) → Recording ⇄ Paused → Finalizing → Idle`
 
 ## 5. Milestones & Tasks
 
@@ -139,6 +139,9 @@ ffmpeg -f lavfi -i "ddagrab=output_idx=0:framerate=60:draw_mouse=1:offset_x=X:of
 - [x] Pause/resume with segment concat: `Win+Alt+P` (fallback `Ctrl+Alt+P`; `Win+Shift+P` is the
       Windows display-switch hotkey — do not use), tray Pause/Resume/Stop with enable states ✅
       verified: 3 s + pause 2 s + 1.5 s → single 4.5 s MP4 with audio, twice in a row
+- [x] Region screenshot (Snipping-Tool style): same drag-select, then a Record/Screenshot chooser;
+      screenshot = `ddagrab -frames:v 1` → PNG in `screenshot_dir` (defaults to `output_dir`) ✅
+      verified: 801×501 region → 801×501 PNG (`test_shot.ps1`)
 - [ ] Per-source volume knobs in settings
 - [ ] Countdown timer, re-select-last-region (`Win+Shift+G`)
 - [ ] Quality presets (1080p/4K, 30/60 fps, bitrate), output format MP4/MKV
@@ -194,7 +197,8 @@ snapper/
     capture.rs    # ffmpeg sidecar: variant fallback chain, stdin stop, segment polling, finalize mux
     util.rs       # monitors (EnumDisplayMonitors), rect math, ffmpeg lookup
     config.rs     # %APPDATA%\Snapper\config.json
-  e2e_test.ps1    # injected-input end-to-end test (hotkey + drag + ffprobe check)
+  e2e_test.ps1    # injected-input end-to-end test (hotkey + drag + record + ffprobe check)
+  test_shot.ps1   # injected-input screenshot test (hotkey + drag + chooser + ffprobe check)
   plan.md  design.md  README.md
   target/release/snapper.exe   # ~0.6 MB; ship ffmpeg.exe beside it
 ```

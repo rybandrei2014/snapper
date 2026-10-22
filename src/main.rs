@@ -28,7 +28,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub use overlay::WM_APP_SELECTION;
+pub use overlay::{WM_APP_ACTION, WM_APP_SELECTION};
 const HOTKEY_REC: i32 = 1;
 const HOTKEY_PAUSE: i32 = 2;
 
@@ -36,10 +36,26 @@ const HOTKEY_PAUSE: i32 = 2;
 enum Mode {
     Idle,
     Selecting,
+    Choosing,
     Recording,
     Pausing,
     Paused,
     Stopping,
+}
+
+struct PendingSel {
+    params: capture::SegParams,
+    rect: windows::Win32::Foundation::RECT,
+    base: PathBuf,
+    name: String,
+}
+
+struct App {
+    cfg: config::Config,
+    mode: Mode,
+    recording: Option<Recording>,
+    pending: Option<PendingSel>,
+    last_out: Option<PathBuf>,
 }
 
 struct Recording {
@@ -50,13 +66,6 @@ struct Recording {
     seq: u32,
     seg: Option<capture::Segment>,
     retried: bool,
-}
-
-struct App {
-    cfg: config::Config,
-    mode: Mode,
-    recording: Option<Recording>,
-    last_out: Option<PathBuf>,
 }
 
 struct MenuItems {
@@ -107,6 +116,7 @@ fn main() -> Result<()> {
         cfg,
         mode: Mode::Idle,
         recording: None,
+        pending: None,
         last_out: None,
     };
 
@@ -193,7 +203,8 @@ fn main() -> Result<()> {
                     HOTKEY_PAUSE => toggle_pause(&mut app, &tray, &items),
                     _ => {}
                 },
-                WM_APP_SELECTION => on_selection(&mut app, msg.wParam.0, &tray, &items),
+                WM_APP_SELECTION => on_selection(&mut app, msg.wParam.0, main, &tray, &items),
+                WM_APP_ACTION => on_action(&mut app, msg.wParam.0, &tray, &items),
                 _ => {
                     unsafe {
                         let _ = TranslateMessage(&msg);
@@ -253,6 +264,12 @@ fn toggle_rec(app: &mut App, main: HWND, tray: &TrayIcon, items: &MenuItems) {
             }
         }
         Mode::Recording => stop_rec(app, tray, items),
+        Mode::Choosing => {
+            overlay::hide_action_bar();
+            app.pending = None;
+            app.mode = Mode::Idle;
+            update_menu(app.mode, items);
+        }
         Mode::Paused => {
             // stop while paused: finalize what we have
             app.mode = Mode::Stopping;
@@ -323,7 +340,7 @@ fn segment_path(base: &PathBuf, seq: u32) -> PathBuf {
     base.with_extension(format!("seg{seq:03}.mp4"))
 }
 
-fn on_selection(app: &mut App, ok: usize, tray: &TrayIcon, items: &MenuItems) {
+fn on_selection(app: &mut App, ok: usize, main: HWND, tray: &TrayIcon, items: &MenuItems) {
     app.mode = Mode::Idle;
     update_menu(app.mode, items);
     if ok == 0 {
@@ -352,12 +369,43 @@ fn on_selection(app: &mut App, ok: usize, tray: &TrayIcon, items: &MenuItems) {
         h: rect.bottom - rect.top,
         output_idx: idx,
     };
-    let seg_path = segment_path(&base, 0);
-    match capture::start_segment(&app.cfg, params, &seg_path, None) {
+    app.pending = Some(PendingSel {
+        params,
+        rect,
+        base,
+        name,
+    });
+    app.mode = Mode::Choosing;
+    update_menu(app.mode, items);
+    let _ = tray.set_tooltip(Some("Snapper — Record or Screenshot? (Esc cancels)"));
+    overlay::show_action_bar(main, rect);
+}
+
+fn on_action(app: &mut App, choice: usize, tray: &TrayIcon, items: &MenuItems) {
+    overlay::hide_action_bar();
+    let Some(pend) = app.pending.take() else {
+        app.mode = Mode::Idle;
+        update_menu(app.mode, items);
+        return;
+    };
+    app.mode = Mode::Idle;
+    update_menu(app.mode, items);
+    match choice {
+        1 => start_recording(app, pend, tray, items),
+        2 => take_screenshot(app, &pend, tray),
+        _ => {
+            let _ = tray.set_tooltip(Some("Snapper — cancelled"));
+        }
+    }
+}
+
+fn start_recording(app: &mut App, pend: PendingSel, tray: &TrayIcon, items: &MenuItems) {
+    let seg_path = segment_path(&pend.base, 0);
+    match capture::start_segment(&app.cfg, pend.params, &seg_path, None) {
         Ok((seg, entry, fmt)) => {
             app.recording = Some(Recording {
-                params,
-                base,
+                params: pend.params,
+                base: pend.base,
                 segments: vec![entry],
                 audio_fmt: fmt,
                 seq: 0,
@@ -366,12 +414,30 @@ fn on_selection(app: &mut App, ok: usize, tray: &TrayIcon, items: &MenuItems) {
             });
             app.mode = Mode::Recording;
             update_menu(app.mode, items);
-            overlay::show_border(rect);
-            let _ = tray.set_tooltip(Some(format!("Snapper — recording ({name})")));
+            overlay::show_border(pend.rect);
+            let _ = tray.set_tooltip(Some(format!("Snapper — recording ({})", pend.name)));
         }
         Err(e) => {
             eprintln!("capture: {e}");
             let _ = tray.set_tooltip(Some(format!("Snapper — error: {e}")));
+        }
+    }
+}
+
+fn take_screenshot(app: &mut App, pend: &PendingSel, tray: &TrayIcon) {
+    let out = app.cfg.screenshot_dir().join(format!("{}.png", pend.name));
+    match capture::grab_frame(&app.cfg, pend.params, &out) {
+        Ok(()) => {
+            app.last_out = Some(out.clone());
+            let label = out
+                .file_name()
+                .map(|n| format!("Snapper — saved {}", n.to_string_lossy()))
+                .unwrap_or_else(|| "Snapper — saved".into());
+            let _ = tray.set_tooltip(Some(&label));
+        }
+        Err(e) => {
+            eprintln!("screenshot: {e}");
+            let _ = tray.set_tooltip(Some(&format!("Snapper — screenshot failed: {e}")));
         }
     }
 }

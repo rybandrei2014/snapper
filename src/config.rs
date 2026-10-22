@@ -12,6 +12,7 @@ pub struct Config {
     pub mic: bool,
     pub audio_bitrate_kbps: u32,
     pub output_dir: PathBuf,
+    pub screenshot_dir: Option<PathBuf>,
     pub ffmpeg_path: Option<PathBuf>,
     pub output_idx_override: Option<i32>,
 }
@@ -31,6 +32,7 @@ impl Default for Config {
             mic: false,
             audio_bitrate_kbps: 192,
             output_dir,
+            screenshot_dir: None,
             ffmpeg_path: None,
             output_idx_override: None,
         }
@@ -38,6 +40,9 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn screenshot_dir(&self) -> PathBuf {
+        self.screenshot_dir.clone().unwrap_or_else(|| self.output_dir.clone())
+    }
     pub fn load() -> Result<Config> {
         let dir = std::env::var("APPDATA")
             .map(PathBuf::from)

@@ -303,6 +303,47 @@ pub fn start_segment(
     ))
 }
 
+/// Grab a single still frame of the region to a PNG (Snipping-Tool style).
+pub fn grab_frame(cfg: &Config, p: SegParams, out: &Path) -> Result<()> {
+    let ffmpeg = util::find_ffmpeg(cfg)?;
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut last_err = String::new();
+    for variant in variants(p, cfg.fps) {
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            variant.input.clone(),
+        ];
+        if let Some(vf) = &variant.vf {
+            args.extend(["-vf".into(), vf.clone()]);
+        }
+        args.extend([
+            "-frames:v".into(),
+            "1".into(),
+            "-f".into(),
+            "image2".into(),
+            "-y".into(),
+            out.display().to_string(),
+        ]);
+        let status = Command::new(&ffmpeg)
+            .args(&args)
+            .creation_flags(0x0800_0000)
+            .status()
+            .map_err(|e| anyhow!("failed to spawn {ffmpeg:?}: {e}"))?;
+        if status.success() && std::fs::metadata(out).map(|m| m.len() > 0).unwrap_or(false) {
+            return Ok(());
+        }
+        last_err = format!("ffmpeg exited {status}");
+    }
+    Err(anyhow!("no working frame grab: {last_err}"))
+}
+
 /// Join finished segments into the final file and remove intermediates.
 pub fn finalize(
     cfg: &Config,

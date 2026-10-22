@@ -2,6 +2,7 @@ use crate::util::wide;
 use anyhow::Result;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -9,8 +10,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS, HBITMAP, HDC,
-    HGDIOBJ, SelectObject,
+    COLOR_BTNFACE, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS,
+    DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush, HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -19,6 +20,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_APP_SELECTION: u32 = 0x8001;
+pub const WM_APP_ACTION: u32 = 0x8002;
 
 const DIM: u32 = 0x8000_0000; // black, alpha 128 (premultiplied)
 const RED: u32 = 0xFF00_00FF; // opaque red (premultiplied)
@@ -59,6 +61,8 @@ unsafe impl Send for BorderState {}
 static OVERLAY: Mutex<Option<OverlayState>> = Mutex::new(None);
 static BORDER: Mutex<Option<BorderState>> = Mutex::new(None);
 static RESULT: Mutex<Option<RECT>> = Mutex::new(None);
+static ACTION_HWND: AtomicIsize = AtomicIsize::new(0);
+static ACTION_MAIN: AtomicIsize = AtomicIsize::new(0);
 
 pub fn take_result() -> Option<RECT> {
     RESULT.lock().unwrap().take()
@@ -92,6 +96,19 @@ pub fn register_class() -> Result<()> {
         };
         if RegisterClassExW(&wc) == 0 {
             return Err(anyhow::anyhow!("RegisterClassExW border failed"));
+        }
+
+        let cls = wide("SnapperAction");
+        let wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(action_wndproc),
+            hInstance: hinst.into(),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            lpszClassName: PCWSTR(cls.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            return Err(anyhow::anyhow!("RegisterClassExW action failed"));
         }
     }
     Ok(())
@@ -373,5 +390,105 @@ unsafe extern "system" fn border_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// Small topmost popup anchored under the selection: Record / Screenshot.
+pub fn show_action_bar(main: HWND, rect: RECT) {
+    unsafe {
+        ACTION_MAIN.store(main.0 as isize, Ordering::SeqCst);
+        let bar_w = 224i32;
+        let bar_h = 44i32;
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        let mut x = rect.right - bar_w;
+        let mut y = rect.bottom + 6;
+        if y + bar_h > vy + vh {
+            y = (rect.top - bar_h - 6).max(vy);
+        }
+        x = x.clamp(vx, (vx + vw - bar_w).max(vx));
+
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let cls = wide("SnapperAction");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            PCWSTR(cls.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            bar_w,
+            bar_h,
+            HWND::default(),
+            HMENU::default(),
+            hinst,
+            None,
+        );
+        let Ok(hwnd) = hwnd else { return };
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let btn_cls = wide("BUTTON");
+        let mut mk = |label: &str, id: usize, bx: i32| {
+            let w = wide(label);
+            let b = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(btn_cls.as_ptr()),
+                PCWSTR(w.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                bx,
+                8,
+                100,
+                28,
+                hwnd,
+                HMENU(id as *mut c_void),
+                hinst,
+                None,
+            );
+            if let Ok(b) = b {
+                let _ = SendMessageW(b, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            }
+        };
+        mk("Record", 1, 8);
+        mk("Screenshot", 2, 116);
+
+        ACTION_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+pub fn hide_action_bar() {
+    let h = ACTION_HWND.swap(0, Ordering::SeqCst);
+    if h != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(h as *mut c_void));
+        }
+    }
+}
+
+unsafe extern "system" fn action_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, _lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = (wp.0 & 0xFFFF) as u16;
+            let code = ((wp.0 >> 16) & 0xFFFF) as u16;
+            if code == 0 {
+                let main = HWND(ACTION_MAIN.load(Ordering::SeqCst) as *mut c_void);
+                ACTION_HWND.store(0, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                let _ = PostMessageW(main, WM_APP_ACTION, WPARAM(id as usize), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wp.0 as u32 == VK_ESCAPE.0 as u32 {
+                let main = HWND(ACTION_MAIN.load(Ordering::SeqCst) as *mut c_void);
+                ACTION_HWND.store(0, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                let _ = PostMessageW(main, WM_APP_ACTION, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, _lp),
     }
 }

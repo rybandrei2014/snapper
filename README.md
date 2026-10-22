@@ -1,27 +1,30 @@
 # Snapper
 
 Lightweight Windows region screen recorder in Rust. Press `Win+Shift+R`, drag a rectangle,
-get an MP4 — the QuickTime-style region recording that Windows 10 Snipping Tool lacks.
+then choose **Record** (MP4) or **Screenshot** (PNG) — the QuickTime-style region capture that
+Windows 10 Snipping Tool lacks.
 
 ## Status
 
-MVP working end-to-end: hotkey → dimmed fullscreen overlay → drag-select →
-`ffmpeg ddagrab` capture of the region + **system audio (WASAPI loopback)** (+ optional mic mix) →
-H.264/AAC MP4 → red border while recording, stop with the same hotkey, **pause/resume** with
-`Win+Alt+P` (segments joined automatically). Verified by `e2e_test.ps1` (injects real
-hotkey + mouse drag, checks output with ffprobe).
+MVP working end-to-end: hotkey → dimmed fullscreen overlay → drag-select → **Record / Screenshot**
+chooser → `ffmpeg ddagrab` capture of the region. Recording adds **system audio (WASAPI loopback)**
+(+ optional mic mix) → H.264/AAC MP4, red border while recording, **pause/resume** with `Win+Alt+P`
+(segments joined automatically). Screenshot grabs one composited frame to PNG. Verified by
+`e2e_test.ps1` (record) and `test_shot.ps1` (screenshot) — both inject real hotkey + mouse input.
 
 Not yet implemented (see plan.md): countdown, settings UI, installer.
 
 ## Usage
 
 1. Make sure `ffmpeg.exe` (6.1+, 7.x recommended) is next to `snapper.exe` or on PATH.
-2. Run `snapper.exe` — it lives in the system tray.
-3. `Win+Shift+R` → screen dims → drag a region → recording starts (red border around region).
-4. `Win+Alt+P` pauses/resumes (falls back to `Ctrl+Alt+P` if taken; `Win+Shift+P` is the Windows
-   display-switch hotkey and is deliberately not used).
-5. `Win+Shift+R` again (or tray → Stop) to finish. `Esc` / right-click cancels selection.
-6. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4`.
+2. Run `snapper.exe` — it lives in the system tray (starts minimized, no window).
+3. `Win+Shift+R` → screen dims → drag a region → a small **Record / Screenshot** bar appears.
+4. **Record**: recording starts (red border). `Win+Alt+P` pauses/resumes (falls back to
+   `Ctrl+Alt+P` if taken; `Win+Shift+P` is the Windows display-switch hotkey and is deliberately
+   not used). `Win+Shift+R` again (or tray → Stop) finishes.
+5. **Screenshot**: writes a single PNG of the region.
+6. `Esc` / right-click cancels selection; `Esc` (or `Win+Shift+R`) dismisses the chooser.
+7. Files land in `%USERPROFILE%\Videos\Snapper\<yyyy-MM-dd_HH-mm-ss>.mp4` / `.png`.
 
 ## Configuration
 
@@ -36,6 +39,7 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
 | `mic` | false | also capture the default microphone and mix it with system audio |
 | `audio_bitrate_kbps` | 192 | AAC bitrate |
 | `output_dir` | `%USERPROFILE%\Videos\Snapper` | output folder |
+| `screenshot_dir` | null | PNG folder (defaults to `output_dir`) |
 | `ffmpeg_path` | null | explicit ffmpeg.exe path |
 | `output_idx_override` | null | force DXGI output index (monitor) |
 
@@ -45,10 +49,11 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
 cargo build --release     # target\release\snapper.exe (~0.6 MB, no runtime needed)
 ```
 
-Test the full flow (drives the app with injected hotkey/mouse input):
+Test the full flows (drive the app with injected hotkey/mouse input):
 
 ```
-powershell -ExecutionPolicy Bypass -File e2e_test.ps1
+powershell -ExecutionPolicy Bypass -File e2e_test.ps1    # record + pause/resume
+powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
 ```
 
 ## How it works
@@ -57,6 +62,8 @@ powershell -ExecutionPolicy Bypass -File e2e_test.ps1
   `offset_x/offset_y/video_size` for the region and `hwdownload,format=bgra` to pull D3D11 frames
   to system memory. A fallback chain (region options → crop filter; `h264_mf` → `libx264`) adapts
   to older ffmpeg builds automatically.
+- **Screenshot:** same `ddagrab` path with `-frames:v 1` → PNG (true composited frame, parity with
+  Snipping Tool). Triggered from the Record/Screenshot chooser after a region is selected.
 - **Audio:** WASAPI capture (`IAudioClient`) on the default render endpoint with
   `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic).
   Each source is written to a raw PCM file during recording (silence is synthesized while the

@@ -18,6 +18,22 @@ public class Inj {
 }
 "@
 
+Add-Type -TypeDefinition @"
+using System;using System.Runtime.InteropServices;
+public class W {
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string name);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
+  public static void ClickButton(string name){
+    IntPtr bar = FindWindowW("SnapperAction", null);
+    if(bar==IntPtr.Zero){ Console.WriteLine("    WARN: no action bar window"); return; }
+    IntPtr btn = FindWindowExW(bar, IntPtr.Zero, "BUTTON", name);
+    if(btn==IntPtr.Zero){ Console.WriteLine("    WARN: no button '" + name + "'"); return; }
+    SendMessageW(btn, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+  }
+}
+"@
+
 $outDir = Join-Path $env:USERPROFILE "Videos\Snapper"
 $before = @(Get-ChildItem $outDir -Filter *.mp4 -ErrorAction SilentlyContinue)
 
@@ -30,10 +46,6 @@ Start-Sleep 3
 "[1] hotkey -> overlay"
 [Inj]::Hotkey()
 Start-Sleep 2
-Add-Type -TypeDefinition @"
-using System;using System.Runtime.InteropServices;
-public class W { [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name); }
-"@
 $hwnd = [W]::FindWindowW("SnapperOverlay", $null)
 "    overlay hwnd: $hwnd"
 
@@ -44,16 +56,20 @@ $hwnd = [W]::FindWindowW("SnapperOverlay", $null)
 [Inj]::Move(1200,800); Start-Sleep -Milliseconds 300
 [Inj]::Up();     Start-Sleep 1
 
-"[3] recording 3s"
+"[3] chooser -> click Record"
+[W]::ClickButton("Record")
+Start-Sleep 1
+
+"[4] recording 3s"
 Start-Sleep 3
 
-"[4] pause (Win+Shift+P), wait 2s, resume"
+"[5] pause (Win+Alt+P), wait 2s, resume"
 [Inj]::HotkeyP()
 Start-Sleep 2
 [Inj]::HotkeyP()
 Start-Sleep 3
 
-"[5] hotkey -> stop"
+"[6] hotkey -> stop"
 [Inj]::Hotkey()
 Start-Sleep 3
 
