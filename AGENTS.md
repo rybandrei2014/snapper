@@ -17,8 +17,17 @@ No UI framework. ffmpeg is an external child process (must be on PATH or next to
 
 ```
 cargo build              # debug  -> target\debug\snapper.exe
-cargo build --release    # release -> target\release\snapper.exe (~0.68 MB, stripped + LTO)
+cargo build --release    # release -> target\release\snapper.exe (~0.78 MB, stripped + LTO)
 ```
+
+**Portability is a hard requirement.** `.cargo/config.toml` sets
+`rustflags = ["-C", "target-feature=+crt-static"]` for `x86_64-pc-windows-msvc`, so the CRT is
+statically linked and the exe imports **only DLLs that ship with Windows 10/11** (d2d1, dwrite,
+gdi32, user32, kernel32, ole32, oleaut32, shell32, ntdll + `api-ms-win-*` API-set stubs). No
+VC++ redistributable, no installer, no bundled runtime. Do NOT remove that config — without it the
+exe links `VCRUNTIME140.dll` + UCRT and breaks on clean machines. Verify with the PE import dump
+(see commit history) if unsure. The only external dependency is **ffmpeg.exe** (a child process,
+must be on PATH or next to the exe) — ship it alongside for a portable bundle.
 
 There is no `cargo test` suite and no lints configured. Verify changes with the e2e scripts below.
 

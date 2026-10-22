@@ -47,8 +47,13 @@ Not yet implemented (see plan.md): countdown, settings UI, installer.
 ## Build
 
 ```
-cargo build --release     # target\release\snapper.exe (~0.6 MB, no runtime needed)
+cargo build --release     # target\release\snapper.exe (~0.78 MB, stripped + LTO)
 ```
+
+The release build statically links the C runtime (`.cargo/config.toml` sets `+crt-static`), so
+`snapper.exe` is **portable** — it imports only DLLs that ship with Windows 10/11 and needs no
+VC++ redistributable, installer, or bundled runtime. The one external dependency is **ffmpeg.exe**
+(see Usage): drop it next to `snapper.exe` for a self-contained folder you can copy anywhere.
 
 Test the full flows (drive the app with injected hotkey/mouse input):
 
