@@ -46,6 +46,23 @@ the exe imports `VCRUNTIME140` or `api-ms-win-crt-*`), zips it, and publishes a 
 `v*` tags (also `workflow_dispatch` for manual runs). The e2e scripts are NOT run in CI (they need a
 real desktop session).
 
+### Changelog / release tagging
+
+`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) + Semantic Versioning.
+Every user-visible change goes under `## [Unreleased]` (grouped `Added` / `Changed` / `Fixed`) as part
+of the change itself — not as a separate "update the changelog" commit. Release notes for the GitHub
+Release are taken from the matching `## [vX.Y.Z]` section by `release.yml`, so the section text is the
+release body verbatim.
+
+To cut a release (mirror `yt-mp3`):
+1. Bump `version` in `Cargo.toml`.
+2. In `CHANGELOG.md`: rename `## [Unreleased]` → `## [vX.Y.Z] - YYYY-MM-DD`, add a fresh empty
+   `## [Unreleased]` above it, and update the compare links at the bottom
+   (`[Unreleased]: .../compare/vX.Y.Z...HEAD`, `[vX.Y.Z]: .../compare/vPREV...vX.Y.Z`).
+3. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z` — the tag triggers the release workflow.
+
+Tags already on the repo: `v0.1.0`.
+
 ## Testing
 
 All tests are PowerShell scripts in the `tests/` folder. They drive the real `snapper.exe`

@@ -58,6 +58,25 @@ jobs:
         run: Compress-Archive -Path dist\* -DestinationPath snapper-win64.zip -Force
         shell: pwsh
 
+      - name: Release notes from CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $body = ""
+          if (Test-Path CHANGELOG.md) {
+            $section = @()
+            $in = $false
+            foreach ($line in Get-Content CHANGELOG.md -Encoding utf8) {
+              if ($line.StartsWith("## ")) { $in = $line.StartsWith("## [$tag]"); continue }
+              if ($in) { if ($line -match '^\[.*\]:\s') { break }; $section += $line }
+            }
+            $body = ($section -join "`n").Trim()
+          }
+          if (-not $body) { $body = "Binaries for $tag - unpack and run snapper.exe (ffmpeg.exe is bundled)." }
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+          Get-Content release-notes.md
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -69,4 +88,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: snapper-win64.zip
-          generate_release_notes: true
+          body_path: release-notes.md
+          make_latest: true
