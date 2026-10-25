@@ -123,20 +123,17 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
-        // Accept the client (ffmpeg) immediately, BEFORE the (sometimes slow)
-        // WASAPI Initialize below. The capture ffmpeg opens this pipe as an
-        // input and will not start muxing video until the open returns; if we
-        // only connect after WASAPI init, ffmpeg's video start is delayed and
-        // the muxer back-fills several seconds of frozen first frame.
+        // Accept the client (the audio recorder ffmpeg) immediately, BEFORE the
+        // (sometimes slow) WASAPI Initialize below, and prime the pipe with
+        // silence. This lets the recorder's raw-PCM demuxer establish the audio
+        // stream and start at the same instant as the video grab, so audio and
+        // the separately-recorded video line up instead of audio lagging by the
+        // WASAPI init time.
         match ConnectNamedPipe(pipe, None) {
             Ok(()) => {}
             Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => {}
             Err(e) => return Err(anyhow!("ConnectNamedPipe: {e}")),
         }
-
-        // Prime the pipe with silence so ffmpeg's raw-PCM demuxer immediately
-        // has data, establishes the audio stream, and starts muxing video from
-        // frame 0 (rather than waiting on the WASAPI Initialize below).
         let _ = write_pipe(&pipe, &vec![0u8; 8192]);
 
         let device = device_for(source)?;

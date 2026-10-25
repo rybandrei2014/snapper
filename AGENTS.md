@@ -86,11 +86,12 @@ Notes:
   glyph fallback). All bar/menu icons are drawn as **geometry** (not font glyphs). Largest file.
 - `theme.rs` — design tokens (colors, DIP metrics, fonts), DPI scale helpers, the one MDL2 glyph
   still used (tray camera).
-- `capture.rs` — ffmpeg child-process lifecycle: spawn `ddagrab` region capture, assign to a Win32
-  job object (so children can't outlive the app), health check, and `finalize` (clean `q` + exact
-  re-encode trim of paused spans).
+- `capture.rs` — ffmpeg child-process lifecycle: spawn a **video-only** `ddagrab` region capture
+  (`-an`) plus a **separate audio ffmpeg** fed by the WASAPI pipe, assign both to a Win32 job object
+  (so children can't outlive the app), health check, and `finalize` (mux video + `audio.m4a` into one
+  file with `-c copy`, then a clean `q` + exact re-encode trim of paused spans on the combined file).
 - `audio.rs` — WASAPI loopback (system audio) + optional mic, streamed as raw PCM over a named pipe
-  into the same ffmpeg process so A/V share one clock.
+  into the **audio ffmpeg** (a distinct process from the video grab — see Capture / pause model).
 - `config.rs` — load/save `config.json` next to the exe (portable; `%APPDATA%\Snapper` fallback
   when the exe folder isn't writable, legacy `%APPDATA%` config auto-migrates). See README table.
 - `util.rs` — small helpers (e.g. `wide`/`u16s` wide-string conversion, error helpers).
@@ -139,12 +140,19 @@ Notes:
 
 ## Capture / pause model
 
-- One ffmpeg process records the whole session; it is **never restarted**. Pause/resume just mark
-  wall-clock spans; on stop, `q` closes ffmpeg cleanly and `finalize` cuts the paused spans out with
-  an exact re-encode trim (`trim`/`atrim`+`concat`), mapping wall clock → file timeline.
+- The video grab ffmpeg records the whole session **video only** (`-an`); it is **never restarted**.
+  A separate audio ffmpeg captures the WASAPI pipe to `audio.m4a`. Pause/resume just mark wall-clock
+  spans; on stop, `q` closes both cleanly, `finalize` muxes video + `audio.m4a` (`-c copy`), then cuts
+  the paused spans out with an exact re-encode trim (`trim`/`atrim`+`concat`) on the combined file,
+  mapping wall clock → file timeline.
+- **Gotcha — do NOT feed the live audio pipe into the grab ffmpeg as a second input.** With two live
+  inputs, ffmpeg's muxer delays reading video and CFR-backfills several seconds of a frozen first
+  frame (audio plays, image stuck ~4 s at the start). This was a regression (commit `5b5452b`); the
+  video-only grab + separate audio + mux-at-finalize design fixes it.
 - `Segment.start` is set to `t0` captured at **spawn** (not after the health check) so the video
   timeline matches when the border appears; the health check window is 250 ms.
-- ffmpeg children are assigned to a Win32 job object so they can never outlive the app.
+- ffmpeg children (video grab + audio recorder) are assigned to a Win32 job object so they can never
+  outlive the app.
 
 ## Style notes
 

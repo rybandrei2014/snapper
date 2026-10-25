@@ -74,9 +74,10 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   Snipping Tool). Triggered from the Record/Screenshot chooser after a region is selected.
 - **Audio:** WASAPI capture (`IAudioClient`) on the default render endpoint with
   `AUDCLNT_STREAMFLAGS_LOOPBACK` (system sound) and optionally the default capture endpoint (mic).
-  Each source is streamed as raw PCM over a named pipe **into the same ffmpeg process** that captures
-  video, so ffmpeg timestamps audio and video on one clock (A/V stay in sync). With mic enabled the
-  two are mixed via `amix`. Silence is synthesized while the system is quiet so sample-count
+  Each source is streamed as raw PCM over a named pipe into a **separate audio ffmpeg process**
+  (muxed with the video-only capture at finalize — keeping audio out of the grab ffmpeg avoids it
+  stalling/back-filling the first video frames). With mic enabled the two sources are mixed via
+  `amix`. Silence is synthesized while the system is quiet so sample-count
   timestamps keep tracking wall-clock time. If a source fails, recording degrades (mic-only failure →
   system audio only; audio failure → video-only).
 - **UI:** pure Win32 via the `windows` crate — layered per-pixel-alpha windows for the dimmed
@@ -85,12 +86,13 @@ powershell -ExecutionPolicy Bypass -File test_shot.ps1   # region screenshot
   (Record/Screenshot chooser, Pause/Stop + live timer) and a custom capsule tray menu —
   Segoe UI text, icon-only controls, hover pills, DPI-scaled; anti-aliased tray icon with
   recording/paused state dots; `RegisterHotKey` for the global hotkey. Single instance via a named mutex.
-- **Stop / pause:** one ffmpeg process records the whole session; it is never restarted. Pause/resume
-   just mark wall-clock spans; on stop, `q` closes ffmpeg cleanly and `finalize` cuts the paused spans
-   out of the continuous file with an exact re-encode trim (`trim`/`atrim`+`concat`), mapping the wall
-   clock onto the file timeline. This avoids the per-segment cold start that previously caused a ~1 s
-   frozen frame + audio dropout at every resume. ffmpeg children are assigned to a Win32 job object so
-   they can never outlive the app.
+- **Stop / pause:** the video grab ffmpeg records the whole session (video only, never restarted) and a
+   separate audio ffmpeg records alongside it. Pause/resume just mark wall-clock spans; on stop, `q`
+   closes both cleanly, `finalize` muxes video + `audio.m4a` into one file, then cuts the paused spans
+   out with an exact re-encode trim (`trim`/`atrim`+`concat`), mapping the wall clock onto the file
+   timeline. This avoids the per-segment cold start that previously caused a ~1 s frozen frame +
+   audio dropout at every resume. ffmpeg children are assigned to a Win32 job object so they can never
+   outlive the app.
 
 ## License
 
