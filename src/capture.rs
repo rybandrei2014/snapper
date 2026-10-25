@@ -44,6 +44,7 @@ pub struct Segment {
     stdin: Option<ChildStdin>,
     audio_stops: Vec<Arc<AtomicBool>>,
     audio_pipes: Vec<isize>,
+    audio_child: Option<Child>,
     start: std::time::Instant,
 }
 
@@ -68,9 +69,13 @@ impl Segment {
             flag.store(true, Ordering::SeqCst);
         }
         // Closing the server pipe unblocks any capture thread still in
-        // ConnectNamedPipe and makes in-flight writes fail.
+        // ConnectNamedPipe and makes in-flight writes fail. It also gives the
+        // audio ffmpeg EOF on its pipe input so it finalizes its output file.
         for h in self.audio_pipes.drain(..) {
             audio::close_pipe(h);
+        }
+        if let Some(mut c) = self.audio_child.take() {
+            let _ = c.wait();
         }
     }
 
@@ -271,8 +276,16 @@ pub fn start_segment(
     };
 
     let mut last_err = String::new();
-    let mut started: Option<(Child, ChildStdin, Vec<Arc<AtomicBool>>, Vec<isize>, std::time::Instant)> =
-        None;
+    let mut started: Option<
+        (
+            Child,
+            ChildStdin,
+            Vec<Arc<AtomicBool>>,
+            Vec<isize>,
+            Option<Child>,
+            std::time::Instant,
+        ),
+    > = None;
 
     for (vi, variant) in variants(p, cfg.fps).iter().enumerate() {
         for encoder in &encoders {
@@ -315,7 +328,11 @@ pub fn start_segment(
                 audio_stops.push(flag);
             }
 
-            let args = build_args(variant, encoder, &audio_specs, &pipe_names, seg_path, cfg);
+            // Capture VIDEO ONLY (no audio input in this ffmpeg): feeding a live
+            // audio input alongside the screen grab makes ffmpeg hold/duplicate
+            // the first video frames for several seconds. Audio is captured in a
+            // separate process (below) and muxed at finalize.
+            let args = build_args(variant, encoder, &[], &[], seg_path, cfg);
             let log_path = seg_path.with_extension(format!("v{vi}.{encoder}.log"));
             let log_file = std::fs::File::create(&log_path).ok();
             let spawn_res = Command::new(&ffmpeg)
@@ -365,6 +382,83 @@ pub fn start_segment(
                 }
             }
 
+            // Separate audio recorder: reads the PCM pipe(s) and writes audio
+            // to its own m4a. Running it as a distinct process keeps the screen
+            // grab (above) free of a second live input, which is what caused the
+            // several-second frozen first frame. Muxed with video at finalize.
+            let audio_child: Option<Child> = if audio_specs.is_empty() {
+                None
+            } else {
+                let out = seg_path.with_extension("audio.m4a");
+                let mut aargs: Vec<String> =
+                    vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+                for ((_, mf), name) in audio_specs.iter().zip(pipe_names.iter()) {
+                    aargs.extend([
+                        "-f".into(),
+                        mf.ffmpeg_fmt.into(),
+                        "-ar".into(),
+                        mf.rate.to_string(),
+                        "-ac".into(),
+                        mf.channels.to_string(),
+                        "-i".into(),
+                        name.clone(),
+                    ]);
+                }
+                if audio_specs.len() == 1 {
+                    aargs.extend(["-map".into(), "0:a".into()]);
+                } else {
+                    aargs.extend([
+                        "-filter_complex".into(),
+                        "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[a]".into(),
+                        "-map".into(),
+                        "[a]".into(),
+                    ]);
+                }
+                aargs.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{}K", cfg.audio_bitrate_kbps),
+                    "-y".into(),
+                    out.display().to_string(),
+                ]);
+                let alog = seg_path.with_extension(format!("a{vi}.log"));
+                let alogf = std::fs::File::create(&alog).ok();
+                match Command::new(&ffmpeg)
+                    .args(&aargs)
+                    .creation_flags(0x0800_0000)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(match alogf {
+                        Some(f) => Stdio::from(f),
+                        None => Stdio::null(),
+                    })
+                    .spawn()
+                {
+                    Ok(ac) => {
+                        if job != INVALID_HANDLE_VALUE {
+                            unsafe {
+                                let ph = OpenProcess(
+                                    PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                                    false,
+                                    ac.id(),
+                                )
+                                .unwrap_or(INVALID_HANDLE_VALUE);
+                                if ph != INVALID_HANDLE_VALUE {
+                                    let _ = AssignProcessToJobObject(job, ph);
+                                    let _ = CloseHandle(ph);
+                                }
+                            }
+                        }
+                        Some(ac)
+                    }
+                    Err(e) => {
+                        eprintln!("[audio] recorder failed to start, recording without sound: {e}");
+                        None
+                    }
+                }
+            };
+
             // short health window: bad variants (bad options, filter format
             // errors) exit within ~100 ms. Keep it short so Resume feels
             // instant and the UI thread isn't blocked; the border + control
@@ -380,12 +474,22 @@ pub fn start_segment(
                 }
             }
             if alive {
-                started = Some((child, stdin, audio_stops, pipe_handles, t0));
+                started = Some((
+                    child,
+                    stdin,
+                    audio_stops,
+                    pipe_handles,
+                    audio_child,
+                    t0,
+                ));
                 break;
             }
 
             // attempt failed: kill ffmpeg, stop+unblock audio threads
             let _ = child.kill();
+            if let Some(mut ac) = audio_child {
+                let _ = ac.kill();
+            }
             for f in &audio_stops {
                 f.store(true, Ordering::SeqCst);
             }
@@ -398,7 +502,7 @@ pub fn start_segment(
         }
     }
 
-    let (child, stdin, audio_stops, audio_pipes, t0) =
+    let (child, stdin, audio_stops, audio_pipes, audio_child, t0) =
         started.ok_or_else(|| anyhow!("no working capture: {last_err}"))?;
 
     Ok(Segment {
@@ -406,6 +510,7 @@ pub fn start_segment(
         stdin: Some(stdin),
         audio_stops,
         audio_pipes,
+        audio_child,
         start: t0,
     })
 }
@@ -467,12 +572,62 @@ pub fn finalize(
         return Err(anyhow!("no valid recording"));
     }
 
+    let ffmpeg = util::find_ffmpeg(cfg)?;
+
+    // The capture ffmpeg records VIDEO ONLY (a second live audio input in that
+    // process made ffmpeg hold/duplicate the first several video frames). Audio
+    // was recorded to a separate audio.m4a; mux it in here so the pause trim and
+    // playback both operate on a single A/V file.
+    let audio = raw.with_extension("audio.m4a");
+    let has_audio = std::fs::metadata(&audio).map(|m| m.len() > 0).unwrap_or(false);
+    let mut work = raw.to_path_buf();
+    let mut with_audio = false;
+    if has_audio {
+        let m = raw.with_extension("muxed.mp4");
+        let st = Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                &raw.display().to_string(),
+                "-i",
+                &audio.display().to_string(),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c",
+                "copy",
+                "-shortest",
+                "-y",
+                &m.display().to_string(),
+            ])
+            .creation_flags(0x0800_0000)
+            .status()?;
+        let _ = std::fs::remove_file(&audio);
+        if st.success() {
+            work = m;
+            with_audio = true;
+        } else {
+            let _ = std::fs::remove_file(&work);
+        }
+    }
+    let work = work.as_path();
+    let cleanup_all = |raw: &Path, work: &Path| {
+        if work != raw {
+            let _ = std::fs::remove_file(work);
+        }
+        cleanup(raw);
+    };
+
     if paused_wall.is_empty() {
-        std::fs::rename(raw, base)?;
+        std::fs::rename(work, base)?;
+        cleanup(raw);
         return Ok(());
     }
 
-    let total_out = ffprobe_duration(cfg, raw)?;
+    let total_out = ffprobe_duration(cfg, work)?;
     // ffmpeg's first frame lags spawn by a constant `init`; map wall → output.
     let init = (total_wall - total_out).max(0.0);
     let spans: Vec<(f64, f64)> = paused_wall
@@ -507,11 +662,10 @@ pub fn finalize(
     }
     kept.retain(|(s, e)| e - s > 0.05);
     if kept.is_empty() {
-        cleanup(raw);
+        cleanup_all(raw, work);
         return Err(anyhow!("nothing left after trim"));
     }
 
-    let with_audio = cfg.audio;
     let mut fc = String::new();
     let mut inputs = String::new();
     for (i, (s, e)) in kept.iter().enumerate() {
@@ -534,13 +688,12 @@ pub fn finalize(
         if with_audio { 1 } else { 0 }
     ));
 
-    let ffmpeg = util::find_ffmpeg(cfg)?;
     let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
         "-i".into(),
-        raw.display().to_string(),
+        work.display().to_string(),
         "-filter_complex".into(),
         fc,
         "-map".into(),
@@ -574,10 +727,10 @@ pub fn finalize(
         .creation_flags(0x0800_0000)
         .status()?;
     if !status.success() {
-        cleanup(raw);
+        cleanup_all(raw, work);
         return Err(anyhow!("trim failed: {status}"));
     }
-    cleanup(raw);
+    cleanup_all(raw, work);
     Ok(())
 }
 

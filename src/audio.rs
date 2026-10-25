@@ -122,6 +122,23 @@ pub fn start(source: Source, pipe_raw: isize, stop: Arc<AtomicBool>) {
 fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        // Accept the client (ffmpeg) immediately, BEFORE the (sometimes slow)
+        // WASAPI Initialize below. The capture ffmpeg opens this pipe as an
+        // input and will not start muxing video until the open returns; if we
+        // only connect after WASAPI init, ffmpeg's video start is delayed and
+        // the muxer back-fills several seconds of frozen first frame.
+        match ConnectNamedPipe(pipe, None) {
+            Ok(()) => {}
+            Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => {}
+            Err(e) => return Err(anyhow!("ConnectNamedPipe: {e}")),
+        }
+
+        // Prime the pipe with silence so ffmpeg's raw-PCM demuxer immediately
+        // has data, establishes the audio stream, and starts muxing video from
+        // frame 0 (rather than waiting on the WASAPI Initialize below).
+        let _ = write_pipe(&pipe, &vec![0u8; 8192]);
+
         let device = device_for(source)?;
         let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
         let wf = client.GetMixFormat()?;
@@ -137,13 +154,6 @@ fn run_capture(source: Source, pipe: HANDLE, stop: &AtomicBool) -> Result<()> {
         client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, wf, None)?;
         CoTaskMemFree(Some(wf as *const c_void));
         let capture: IAudioCaptureClient = client.GetService()?;
-
-        // Block until ffmpeg opens the pipe (its startup).
-        match ConnectNamedPipe(pipe, None) {
-            Ok(()) => {}
-            Err(_) if GetLastError() == ERROR_PIPE_CONNECTED => {}
-            Err(e) => return Err(anyhow!("ConnectNamedPipe: {e}")),
-        }
 
         client.Start()?;
         let mut last_write = std::time::Instant::now();
