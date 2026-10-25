@@ -61,7 +61,7 @@ To cut a release (mirror `yt-mp3`):
    (`[Unreleased]: .../compare/vX.Y.Z...HEAD`, `[vX.Y.Z]: .../compare/vPREV...vX.Y.Z`).
 3. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z` — the tag triggers the release workflow.
 
-Tags already on the repo: `v0.1.0`.
+Tags already on the repo: `v0.1.0`, `v0.2.0`.
 
 ## Testing
 

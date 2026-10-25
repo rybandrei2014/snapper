@@ -6,6 +6,8 @@ Release notes for GitHub Releases are taken from the matching `## [vX.Y.Z]` sect
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-10-25
+
 ### Added
 
 - Custom app icon: the tray icon and the embedded `.exe` icon are now generated from a 256px master (`assets\icon.png`), replacing the MDL2 glyph fallback.
@@ -22,5 +24,6 @@ Release notes for GitHub Releases are taken from the matching `## [vX.Y.Z]` sect
 - Region capture via `ffmpeg ddagrab` + system audio (WASAPI loopback, optional mic), red recording border, Pause/Stop capsule bar, pause/resume with paused spans trimmed out on stop.
 - Portable build (static CRT — no VC++ redistributable, installer, or bundled runtime); GitHub Actions release bundles a pinned ffmpeg.
 
-[Unreleased]: https://github.com/rybandrei2014/snapper/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rybandrei2014/snapper/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/rybandrei2014/snapper/compare/v0.1.0...v0.2.0
 [v0.1.0]: https://github.com/rybandrei2014/snapper/releases/tag/v0.1.0
