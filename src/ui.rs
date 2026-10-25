@@ -1134,9 +1134,186 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 // ---------------------------------------------------------------- tray icon
 
-/// Renders the tray glyph (camera + state dot) at `size` physical px.
+static ICON_RGBA: OnceLock<Option<(u32, u32, Vec<u8>)>> = OnceLock::new();
+
+/// Decodes assets/icon.png (RGBA8) once; None if the asset is missing.
+fn icon_rgba() -> Option<&'static (u32, u32, Vec<u8>)> {
+    ICON_RGBA
+        .get_or_init(|| {
+            let bytes = include_bytes!("../assets/icon-128.png");
+            let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            let Ok(mut reader) = decoder.read_info() else {
+                return None;
+            };
+            let w = reader.info().width;
+            let h = reader.info().height;
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            if reader
+                .next_frame(&mut buf)
+                .map_err(|_| ())
+                .and_then(|_| {
+                    if reader.info().color_type != png::ColorType::Rgba {
+                        return Err(());
+                    }
+                    Ok(())
+                })
+                .is_ok()
+            {
+                Some((w, h, buf))
+            } else {
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn mix_u8(a: u8, b: u8, f: u32) -> u8 {
+    (a as u32 * (1000 - f) / 1000 + b as u32 * f / 1000) as u8
+}
+
+/// High-quality downscale of RGBA8: progressive 2x2 box halving, then bilinear.
+fn hscale(src: &[u8], sw: u32, sh: u32, w: u32, h: u32) -> Vec<u8> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let mut cur = src.to_vec();
+    let mut cw = sw;
+    let mut ch = sh;
+    while cw / 2 >= w && ch / 2 >= h && cw > 1 && ch > 1 {
+        let nw = (cw + 1) / 2;
+        let nh = (ch + 1) / 2;
+        let mut next = vec![0u8; (nw as usize) * (nh as usize) * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0u32; 4];
+                let mut cnt = 0u32;
+                for dy in 0..2 {
+                    let sy = y * 2 + dy;
+                    if sy >= ch {
+                        continue;
+                    }
+                    for dx in 0..2 {
+                        let sx = x * 2 + dx;
+                        if sx >= cw {
+                            continue;
+                        }
+                        let o = (sy as usize * cw as usize + sx as usize) * 4;
+                        for c in 0..4 {
+                            acc[c] += cur[o + c] as u32;
+                        }
+                        cnt += 1;
+                    }
+                }
+                let o = (y as usize * nw as usize + x as usize) * 4;
+                for c in 0..4 {
+                    next[o + c] = (acc[c] / cnt) as u8;
+                }
+            }
+        }
+        cur = next;
+        cw = nw;
+        ch = nh;
+    }
+    let mut dst = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let fx = ((x as f64 + 0.5) * cw as f64 / w as f64) - 0.5;
+            let fy = ((y as f64 + 0.5) * ch as f64 / h as f64) - 0.5;
+            let x0 = fx.floor().max(0.0) as u32;
+            let y0 = fy.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(cw - 1);
+            let y1 = (y0 + 1).min(ch - 1);
+            let tx = ((fx - x0 as f64) * 1000.0).clamp(0.0, 1000.0) as u32;
+            let ty = ((fy - y0 as f64) * 1000.0).clamp(0.0, 1000.0) as u32;
+            let ro = |yy: u32, xx: u32| (yy as usize * cw as usize + xx as usize) * 4;
+            let (a0, b0, c0, d0) = (ro(y0, x0), ro(y0, x1), ro(y1, x0), ro(y1, x1));
+            let o = (y as usize * w as usize + x as usize) * 4;
+            for c in 0..4 {
+                let top = mix_u8(cur[a0 + c], cur[b0 + c], tx);
+                let bot = mix_u8(cur[c0 + c], cur[d0 + c], tx);
+                dst[o + c] = mix_u8(top, bot, ty);
+            }
+        }
+    }
+    dst
+}
+
+/// Premultiplies `rgba` (size x size) into the BGRA DIB `bits`.
+unsafe fn blit_rgba(bits: &mut [u32], rgba: &[u8], size: usize) {
+    for i in 0..size * size {
+        let o = i * 4;
+        let r = rgba[o] as u32;
+        let g = rgba[o + 1] as u32;
+        let b = rgba[o + 2] as u32;
+        let a = rgba[o + 3] as u32;
+        bits[i] = (a << 24)
+            | ((b * a / 255) << 16)
+            | ((g * a / 255) << 8)
+            | (r * a / 255);
+    }
+}
+
+/// State dot painted at the bottom-right of the tray icon.
+unsafe fn draw_state_dot_gdi(dc: HDC, size: i32, state: u8) {
+    if state == 0 {
+        return;
+    }
+    let c = if state == 1 { theme::accent() } else { theme::amber() };
+    let rf = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    let ring = (size as f32 * 0.08).max(1.0) as i32;
+    let r = (size as f32 * 0.26) as i32;
+    let cx = size - r - (size as f32 * 0.04) as i32 - 1;
+    let cy = size - r - (size as f32 * 0.04) as i32 - 1;
+    let hp = CreatePen(PS_SOLID, ring, COLORREF(0x000000));
+    let obp = SelectObject(dc, hp);
+    let hb = CreateSolidBrush(COLORREF(
+        (rf(c.b) as u32) << 16 | (rf(c.g) as u32) << 8 | rf(c.r) as u32,
+    ));
+    let obb = SelectObject(dc, hb);
+    let _ = Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+    SelectObject(dc, obb);
+    SelectObject(dc, obp);
+    let _ = DeleteObject(hb);
+    let _ = DeleteObject(hp);
+}
+
+/// Renders the tray glyph (app icon + state dot) at `size` physical px.
 /// Returns RGBA8 (un-premultiplied) for tray_icon::Icon::from_rgba.
 pub fn render_tray_icon(state: u8, size: i32) -> Vec<u8> {
+    if let Some((iw, ih, src)) = icon_rgba() {
+        let scaled = hscale(src, *iw, *ih, size as u32, size as u32);
+        unsafe {
+            let (dib, dc, bits, _dcr) = make_surface(size, size, 1.0).expect("tray dib");
+            let n = (size as usize) * (size as usize);
+            std::slice::from_raw_parts_mut(bits, n).fill(0);
+            blit_rgba(std::slice::from_raw_parts_mut(bits, n), &scaled, size as usize);
+            draw_state_dot_gdi(dc, size, state);
+            let buf = std::slice::from_raw_parts(bits, n);
+            let mut rgba = vec![0u8; n * 4];
+            for i in 0..n {
+                let b = buf[i];
+                let a = (b >> 24) as u32;
+                if a == 0 {
+                    continue;
+                }
+                let o = i * 4;
+                let un = |c: u32| (((c & 0xFF) * 255) / a).min(255) as u8;
+                rgba[o] = un(b & 0xFF); // R
+                rgba[o + 1] = un((b >> 8) & 0xFF); // G
+                rgba[o + 2] = un((b >> 16) & 0xFF); // B
+                rgba[o + 3] = a as u8;
+            }
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = DeleteDC(dc);
+            rgba
+        }
+    } else {
+        render_tray_icon_glyph(state, size)
+    }
+}
+
+/// Fallback when assets/icon.png is unavailable: MDL2 camera glyph + state dot.
+fn render_tray_icon_glyph(state: u8, size: i32) -> Vec<u8> {
     unsafe {
         let (dib, dc, bits, dcr) = make_surface(size, size, 1.0).expect("tray dib");
         let Ok(rt) = dcr.cast::<ID2D1RenderTarget>() else {
@@ -1204,9 +1381,9 @@ pub fn render_tray_icon(state: u8, size: i32) -> Vec<u8> {
                 continue;
             }
             let un = |c: u32| (((c & 0xFF) * 255) / a).min(255) as u8;
-            rgba[o] = un((b >> 16) & 0xFF); // R
+            rgba[o] = un(b & 0xFF); // R
             rgba[o + 1] = un((b >> 8) & 0xFF); // G
-            rgba[o + 2] = un(b & 0xFF); // B
+            rgba[o + 2] = un((b >> 16) & 0xFF); // B
             rgba[o + 3] = a as u8;
         }
         let _ = DeleteObject(HGDIOBJ(dib.0));

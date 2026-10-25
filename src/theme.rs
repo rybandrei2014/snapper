@@ -57,7 +57,9 @@ pub const MENU_PAD: f32 = 6.0;
 pub const MENU_SEP_H: f32 = 9.0;
 pub const FONT: f32 = 13.0;
 
-// Segoe MDL2 Assets glyph (tray icon camera; present on Win10 + Win11)
+// Segoe MDL2 Assets glyph (tray icon fallback camera; present on Win10 + Win11).
+// Only used if the embedded assets\icon-128.png failed to decode; the exe icon is
+// assets\icon.ico (embedded by build.rs via app.rc).
 pub const GL_CAMERA: char = '\u{E722}';
 
 pub fn scale_for_rect(r: RECT) -> f32 {

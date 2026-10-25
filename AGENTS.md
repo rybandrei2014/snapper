@@ -29,6 +29,12 @@ exe links `VCRUNTIME140.dll` + UCRT and breaks on clean machines. Verify with th
 (see commit history) if unsure. The only external dependency is **ffmpeg.exe** (a child process,
 must be on PATH or next to the exe) — ship it alongside for a portable bundle.
 
+`build.rs` compiles `app.rc` (embeds `assets\icon.ico` as the exe icon) with the Windows SDK
+`rc.exe`; if the SDK isn't found it warns and ships the default icon. The tray icon is
+`assets\icon-128.png`, embedded into the binary with `include_bytes!` and decoded at runtime (the
+`png` crate); `assets\icon.png` is the 256px master (the size floor for `icon.ico`; regenerate
+`icon.ico` + `icon-128.png` from it if the art changes).
+
 There is no `cargo test` suite and no lints configured. Verify changes with the e2e scripts below.
 
 ## Release / CI
@@ -76,8 +82,8 @@ Notes:
 - `overlay.rs` — fullscreen selection overlay (dim + hairline + live size badge + fade-in) and the
   click-through recording border (accent line + glow). Posts `WM_APP_SELECTION` with the chosen rect.
 - `ui.rs` — the Direct2D/DirectWrite capsule renderer: action bar, control bar (with live mm:ss
-  timer), custom tray menu, and the anti-aliased tray icon (state dots). All bar/menu icons are
-  drawn as **geometry** (not font glyphs). Largest file (~40 KB).
+  timer), custom tray menu, and the tray icon (app PNG downscaled + state dots; MDL2 camera
+  glyph fallback). All bar/menu icons are drawn as **geometry** (not font glyphs). Largest file.
 - `theme.rs` — design tokens (colors, DIP metrics, fonts), DPI scale helpers, the one MDL2 glyph
   still used (tray camera).
 - `capture.rs` — ffmpeg child-process lifecycle: spawn `ddagrab` region capture, assign to a Win32
@@ -116,6 +122,9 @@ Notes:
 - `GetDpiForMonitor`/`MDT_EFFECTIVE_DPI` are in `Win32_UI_HiDpi`; `MONITOR_*` in `Win32_Graphics_Gdi`.
 - `D2D_RECT_F`/`D2D_POINT_2F` are in `Direct2D::Common`; `D2D1_ROUNDED_RECT`/`D2D1_ELLIPSE` in `Direct2D`.
 - `tray-icon` 0.19 has **no `show_notification`** — use tooltips only.
+- A 32-bit `BI_RGB` DIB from `CreateDIBSection` is BGRA in memory, i.e. the `u32` is
+  `A<<24 | R<<16 | G<<8 | B` (byte 0 = B). When converting that back to RGBA8 (tray icon), R
+  comes from the **low** byte — assuming `A|B|G|R` swaps R/B (red renders blue).
 
 ## UI rendering model
 
